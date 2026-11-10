@@ -1,0 +1,17 @@
+{
+  "name": "quotopsy",
+  "version": "0.0.1",
+  "description": "Explains where your Claude Code usage went, weighted by token type. Local only: no network, no LLM calls.",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "quotopsy": "prototype.mjs"
+  },
+  "files": [
+    "prototype.mjs"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED"
+}

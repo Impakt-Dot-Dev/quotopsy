@@ -1,0 +1,6 @@
+# Tester data and local output: never commit logs or summaries
+samples/
+summary*.json
+*.tgz
+node_modules/
+.DS_Store
