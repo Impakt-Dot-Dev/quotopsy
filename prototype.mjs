@@ -15,9 +15,32 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-// HYPOTHESIS: public API price ratios relative to fresh input. Whether weekly
-// limits weight token types the same way is unpublished.
-const WEIGHTS = { fresh: 1, write5m: 1.25, write1h: 2, read: 0.1, output: 5 };
+// HYPOTHESIS: usage is weighted at published API prices, so one unit is one
+// API-equivalent dollar. Whether weekly limits weight token types and models
+// the same way is unpublished.
+// Per model: [input $/MTok, cache read $/MTok]. Output is 5x input, cache
+// writes are 1.25x (5 min) and 2x (1 h) input. Prices as of 2026-10.
+const PRICES = {
+  "claude-fable-5-1": [10, 0.25], "claude-mythos-5-1": [10, 0.25], "claude-fable-5": [10, 1], "claude-mythos-5": [10, 1],
+  "claude-opus-5-5": [4, 0.2], "claude-opus-5": [5, 0.5], "claude-opus-4-8": [5, 0.5], "claude-opus-4-7": [5, 0.5], "claude-opus-4-6": [5, 0.5], "claude-opus-4-5": [5, 0.5],
+  "claude-sonnet-5-5": [2, 0.2], "claude-sonnet-5": [2, 0.2], "claude-sonnet-4-6": [3, 0.3], "claude-sonnet-4-5": [3, 0.3],
+  "claude-haiku-5-5": [0.1, 0.01], "claude-haiku-4-5": [1, 0.1],
+};
+// Models missing from the table are priced like the newest listed model of
+// the same family, and reported so the reader knows.
+const FAMILY = { fable: "claude-fable-5-1", mythos: "claude-mythos-5-1", opus: "claude-opus-5-5", sonnet: "claude-sonnet-5-5", haiku: "claude-haiku-5-5" };
+const assumedPricing = new Map(); // model -> model whose prices were used
+function rates(model = "", usage = {}) {
+  const id = model.replace(/-\d{8}$/, "");
+  let key = id in PRICES ? id : null;
+  if (!key) {
+    key = FAMILY[Object.keys(FAMILY).find((f) => id.includes(f))] ?? "claude-opus-5-5";
+    assumedPricing.set(model, key);
+  }
+  const [input, read] = PRICES[key];
+  const per = (usage.speed === "fast" ? 2 : 1) / 1e6; // fast mode bills at 2x
+  return { fresh: input * per, write5m: 1.25 * input * per, write1h: 2 * input * per, read: read * per, output: 5 * input * per };
+}
 
 const args = process.argv.slice(2);
 const asJson = args.includes("--json");
@@ -65,7 +88,12 @@ function sections(text) {
   const flush = () => { if (chars) out.push([label, chars]); chars = 0; };
   for (const line of text.split("\n")) {
     const top = /^# (.+)/.exec(line), sub = /^## (.+)/.exec(line);
-    if (top) { flush(); inMcp = top[1].startsWith("MCP Server Instructions"); label = alias("section", top[1].slice(0, 40)); }
+    // A <tag> on its own line opens a block; its closing tag ends the block
+    // without handing the text that follows to the previous heading.
+    const open = /^<([a-z][\w-]*)>\s*$/.exec(line), close = /^<\/([a-z][\w-]*)>\s*$/.exec(line);
+    if (open) { flush(); inMcp = false; label = alias("section", `<${open[1]}>`); }
+    else if (close) { chars += line.length + 1; flush(); label = "(no heading)"; continue; }
+    else if (top) { flush(); inMcp = top[1].startsWith("MCP Server Instructions"); label = alias("section", top[1].slice(0, 40)); }
     else if (sub && inMcp) { flush(); label = "MCP instructions: " + alias("server", sub[1].slice(0, 40)); }
     chars += line.length + 1;
   }
@@ -160,15 +188,15 @@ for (const file of findJsonl(root)) {
   for (const name of s.toolNames.values()) { count(calls, toolLabel(name)); count(calls, toolGroup(name)); }
 
   // Sessions without request records: usage is known, its cause is not.
-  for (const { usage } of s.orphans.values()) {
-    const u = splitUsage(usage);
+  for (const { usage, model } of s.orphans.values()) {
+    const u = splitUsage(usage), w = rates(model, usage);
     const cat = "unattributed (no request record)";
     stats.unattributed++;
-    bump(cat, "cache read", "read", u.read, u.read * WEIGHTS.read);
-    bump(cat, "cache write", "write", u.write, u.write5m * WEIGHTS.write5m + u.write1h * WEIGHTS.write1h);
-    bump(cat, "fresh input", "fresh", u.fresh, u.fresh * WEIGHTS.fresh);
-    bump("output", "thinking", "output", u.thinking, u.thinking * WEIGHTS.output);
-    bump("output", "text and tool calls", "output", u.output - u.thinking, (u.output - u.thinking) * WEIGHTS.output);
+    bump(cat, "cache read", "read", u.read, u.read * w.read);
+    bump(cat, "cache write", "write", u.write, u.write5m * w.write5m + u.write1h * w.write1h);
+    bump(cat, "fresh input", "fresh", u.fresh, u.fresh * w.fresh);
+    bump("output", "thinking", "output", u.thinking, u.thinking * w.output);
+    bump("output", "text and tool calls", "output", u.output - u.thinking, (u.output - u.thinking) * w.output);
   }
 
   // Requests are delta-encoded: messages = base's first `keep` + `tail`.
@@ -185,9 +213,9 @@ for (const file of findJsonl(root)) {
     stats.first = !stats.first || req.timestamp < stats.first ? req.timestamp : stats.first;
     stats.last = !stats.last || req.timestamp > stats.last ? req.timestamp : stats.last;
 
-    const u = splitUsage(res.usage);
-    bump("output", "thinking", "output", u.thinking, u.thinking * WEIGHTS.output);
-    bump("output", "text and tool calls", "output", u.output - u.thinking, (u.output - u.thinking) * WEIGHTS.output);
+    const u = splitUsage(res.usage), w = rates(res.model, res.usage);
+    bump("output", "thinking", "output", u.thinking, u.thinking * w.output);
+    bump("output", "text and tool calls", "output", u.output - u.thinking, (u.output - u.thinking) * w.output);
 
     // Prompt order is tools, system, messages; the cache covers a prefix of it.
     const shape = s.shapes.get(req.shapeHash) ?? { tools: [], system: [] };
@@ -208,8 +236,8 @@ for (const file of findJsonl(root)) {
     // ESTIMATE: scale chars to the request's real token total, then charge
     // each segment by position: first `read` tokens, then `write`, then fresh.
     const perChar = prompt / chars;
-    const writeRate = u.write ? (u.write5m * WEIGHTS.write5m + u.write1h * WEIGHTS.write1h) / u.write : 0;
-    const bands = [["read", u.read, WEIGHTS.read], ["write", u.write, writeRate], ["fresh", u.fresh, WEIGHTS.fresh]];
+    const writeRate = u.write ? (u.write5m * w.write5m + u.write1h * w.write1h) / u.write : 0;
+    const bands = [["read", u.read, w.read], ["write", u.write, writeRate], ["fresh", u.fresh, w.fresh]];
     let pos = 0;
     for (const [cat, sub, c] of segs) {
       const end = pos + c * perChar;
@@ -234,7 +262,7 @@ for (const file of findJsonl(root)) {
         : req.keep < baseLen ? "conversation edited or compacted"
         : req.shapeHash !== prev.shapeHash ? "tool list or system prompt changed"
         : "unknown";
-      rebuilds.push({ cause, tokens: lost, wasted: lost * (writeRate - WEIGHTS.read), at: req.timestamp, gapMin: Math.round(gapMin) });
+      rebuilds.push({ cause, tokens: lost, wasted: lost * (writeRate - w.read), at: req.timestamp, gapMin: Math.round(gapMin) });
     }
     prev = { prompt, ts: req.timestamp, model: res.model, shapeHash: req.shapeHash, ttlMin: u.write1h || !u.write ? 60 : 5 };
   }
@@ -287,7 +315,8 @@ const summary = {
   contains: "Token totals, counts, timestamps and model names only. No prompts, code, file paths or tool output. "
     + (redact ? "MCP server names, MCP tool names and prompt section headings are replaced with placeholders." : "Includes MCP server names, tool names and prompt section headings; rerun with --redact to replace them."),
   redacted: redact,
-  weights: WEIGHTS,
+  unit: "API-equivalent US dollars at published prices (hypothesis: limits may weight usage differently)",
+  prices: PRICES, assumedPricing: Object.fromEntries(assumedPricing),
   files: stats.files, requests: stats.requests, requestsWithoutResponse: stats.noResponse, unattributedMessages: stats.unattributed, missingBlobs: stats.missingBlobs,
   from: stats.first, to: stats.last, models: Object.fromEntries(stats.models),
   charsPerToken: { min: cpt[0], median: cpt[cpt.length >> 1], max: cpt[cpt.length - 1] },
@@ -298,16 +327,19 @@ if (asJson) {
   console.log(JSON.stringify(summary, null, 2));
 } else {
   const k = (n) => (n / 1000).toFixed(1).padStart(8) + "k";
+  const usd = (n) => ("$" + n.toFixed(2)).padStart(9);
   const pct = (x) => (x * 100).toFixed(1).padStart(5) + "%";
   console.log(`Quotopsy prototype: ${stats.files} sessions, ${stats.requests} requests, ${stats.first?.slice(0, 10)} to ${stats.last?.slice(0, 10)}`);
   if (redact) console.log(`Redacted: MCP server names, MCP tool names and prompt section headings are placeholders`);
-  console.log(`Weights (hypothesis): fresh 1, cache write 1.25/2, cache read 0.1, output 5\n`);
-  console.log(`${"share".padStart(6)}  ${"weighted".padStart(9)}  ${"read".padStart(9)}  ${"written".padStart(9)}  ${"fresh".padStart(9)}  ${"output".padStart(9)}  calls  category (estimated)`);
+  console.log(`Weighted at published API prices per model (hypothesis: limits may weight usage differently)`);
+  for (const [model, as] of assumedPricing) console.log(`No published price known for ${model}; priced as ${as}`);
+  console.log();
+  console.log(`${"share".padStart(6)}  ${"API $".padStart(9)}  ${"read".padStart(9)}  ${"written".padStart(9)}  ${"fresh".padStart(9)}  ${"output".padStart(9)}  calls  category (estimated)`);
   for (const r of rows) {
-    console.log(`${pct(r.share)}  ${k(r.weighted)}  ${k(r.read)}  ${k(r.write)}  ${k(r.fresh)}  ${k(r.output)}  ${String(r.calls ?? "").padStart(5)}  ${r.name}`);
+    console.log(`${pct(r.share)}  ${usd(r.weighted)}  ${k(r.read)}  ${k(r.write)}  ${k(r.fresh)}  ${k(r.output)}  ${String(r.calls ?? "").padStart(5)}  ${r.name}`);
   }
   const raw = rows.reduce((n, r) => n + r.read + r.write + r.fresh + r.output, 0);
-  console.log(`\nTotal: ${k(total).trim()} weighted units from ${k(raw).trim()} raw tokens`);
+  console.log(`\nTotal: ${usd(total).trim()} API-equivalent from ${k(raw).trim()} raw tokens`);
 
   console.log(`\nInside the larger categories (share of total)`);
   for (const r of rows.filter((r) => r.share >= 0.05 && r.subs.length > 1)) {
@@ -315,7 +347,7 @@ if (asJson) {
     for (const sub of r.subs.slice(0, 5)) console.log(`    ${pct(sub.share)}  ${sub.name}${sub.calls != null ? ` (${sub.calls} calls)` : ""}`);
   }
 
-  console.log(`\nFindings (estimated effect on weighted usage)`);
+  console.log(`\nFindings (estimated effect, share of API-equivalent cost)`);
   for (const f of findings.filter((f) => f.effect >= 0.005)) {
     console.log(`  ${f.upperBound ? "up to" : "     "} ${pct(f.effect)}  ${f.what}\n                 Fix: ${f.fix}`);
   }

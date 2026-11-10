@@ -45,6 +45,10 @@ this and whether names were redacted.
 
 - Tested on Claude Code 2.1.309 only. Older versions may not log the request
   records it relies on; their usage shows as "unattributed".
-- Weights are public API price ratios (cache read 0.1, output 5). How weekly
-  limits weight token types is not published.
-- Different models are treated as costing the same per token.
+- Usage is weighted at published API prices per model (as of 2026-10), so
+  shares are shares of API-equivalent cost. How weekly limits weight token
+  types and models is not published.
+- A model missing from the price table is priced like the newest listed model
+  of its family, and the report says so.
+- Prompt text is split at headings and standalone `<tag>` blocks. Text that
+  follows a heading with no later heading or tag is credited to that heading.
