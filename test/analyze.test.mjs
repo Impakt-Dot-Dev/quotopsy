@@ -2,7 +2,7 @@
 // When a new kind of log turns up in the wild, add a case that reproduces its
 // structure (record types and shapes), not its content.
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -38,11 +38,11 @@ class Session {
   user(content) { return this.add({ type: "user", message: { role: "user", content } }); }
 }
 
-function usageOf({ fresh = 0, read = 0, write1h = 0, write5m = 0, output = 0, thinking = 0, speed }) {
+function usageOf({ fresh = 0, read = 0, write1h = 0, write5m = 0, output = 0, thinking = 0, speed, inference_geo }) {
   return {
     input_tokens: fresh, cache_read_input_tokens: read, cache_creation_input_tokens: write1h + write5m,
     cache_creation: { ephemeral_1h_input_tokens: write1h, ephemeral_5m_input_tokens: write5m },
-    output_tokens: output, output_tokens_details: { thinking_tokens: thinking }, speed,
+    output_tokens: output, output_tokens_details: { thinking_tokens: thinking }, speed, inference_geo,
   };
 }
 
@@ -51,7 +51,16 @@ function run(sessions, options) {
   const root = mkdtempSync(join(tmpdir(), "quotopsy-test-"));
   mkdirSync(join(root, "project"));
   sessions.forEach((s, i) => writeFileSync(join(root, "project", `session-${i}.jsonl`), s.lines.join("\n") + "\n"));
-  return analyze(root, options);
+  const summary = analyze(root, options);
+  // A session that throws is skipped, which would otherwise hide a bug here.
+  assert.equal(summary.filesFailed, 0, "a session file failed to parse");
+  return summary;
+}
+
+// No NaN or Infinity anywhere: JSON would turn them into null.
+function assertFinite(value, path = "summary") {
+  if (typeof value === "number") assert.ok(Number.isFinite(value), `${path} is ${value}`);
+  else if (value && typeof value === "object") for (const [k, v] of Object.entries(value)) assertFinite(v, `${path}.${k}`);
 }
 
 const text = (t) => ({ role: "user", content: [{ type: "text", text: t }] });
@@ -184,9 +193,16 @@ test("prices models from the table, by family when unlisted, and fast mode at do
   near(one("claude-sonnet-4-6-20260101", { fresh: 1e6 }).totalWeighted, 3, "dated model id");
   near(one("claude-opus-5-5", { output: 1e6, speed: "fast" }).totalWeighted, 40, "fast mode");
 
+  near(one("claude-fable-5-2", { fresh: 1e6, read: 1e6 }).totalWeighted, 8.2, "Fable 5.2");
+  near(one("claude-sonnet-5-5", { read: 1e6 }).totalWeighted, 0.1, "Sonnet 5.5 cache read");
+  near(one("claude-opus-4-1-20250805", { output: 1e6 }).totalWeighted, 75, "retired Opus 4.1");
+  near(one("claude-opus-5-5", { fresh: 1e6, inference_geo: "us" }).totalWeighted, 4.4, "US-only inference");
+  near(one("claude-haiku-5-5", { read: 100000 }).totalWeighted, 0.001, "Haiku 5.5 up to 100,000 prompt tokens");
+  near(one("claude-haiku-5-5", { read: 100001 }).totalWeighted, 100001 * 0.05 * M, "Haiku 5.5 above it");
+
   const unknown = one("claude-fable-9", { fresh: 1e6 });
-  near(unknown.totalWeighted, 10, "priced as its family");
-  assert.deepEqual(unknown.assumedPricing, { "claude-fable-9": "claude-fable-5-1" });
+  near(unknown.totalWeighted, 8, "priced as its family");
+  assert.deepEqual(unknown.assumedPricing, { "claude-fable-9": "claude-fable-5-2" });
 });
 
 test("ignores synthetic messages, malformed lines and empty files", () => {
@@ -268,4 +284,113 @@ test("sizes injected context by attachment type, without its text", () => {
   const summary = run([s]);
   assert.deepEqual(summary.injectedByType, { skill_listing: { count: 2, chars: 330 }, date: { count: 1, chars: 0 } });
   assert.ok(!JSON.stringify(summary).includes("SKILL-TEXT"));
+});
+
+// Cases below came out of a code review; each reproduces one defect.
+
+test("a response whose request was not logged still counts", () => {
+  const s = new Session().assistant("never-logged", { fresh: 1000, output: 100 });
+  const summary = run([s]);
+  assert.equal(summary.unattributedMessages, 1);
+  near(summary.totalWeighted, (1000 * 4 + 100 * 20) * M, "total");
+});
+
+test("keeps the input cost of a request whose prompt cannot be rebuilt at all", () => {
+  const s = new Session();
+  s.request("r1", { tail: ["0".repeat(64)], shapeHash: "unknown-shape" }).assistant("r1", { read: 50000, output: 100 });
+  const summary = run([s]);
+  near(summary.totalWeighted, (50000 * 0.2 + 100 * 20) * M, "total");
+  near(summary.byModel[0].share, 1, "model share");
+  near(category(summary, "unresolved messages").weighted, 50000 * 0.2 * M, "the missing message carries the input");
+
+  // With no tools, system prompt or messages to place it on, it is unattributed.
+  const empty = new Session();
+  empty.request("r1", { tail: [], shapeHash: "unknown-shape" }).assistant("r1", { read: 50000 });
+  near(category(run([empty]), "unattributed input").weighted, 50000 * 0.2 * M, "nothing to attribute to");
+});
+
+test("does not spread missing messages over the ones that were found", () => {
+  const s = new Session().shape("shape", [{ name: "Bash", description: "b".repeat(280) }], ["system"]);
+  // The base request is not in this log: 40 kept messages cannot be found.
+  s.request("r2", { base: "gone", keep: 40, tail: [s.blob(text("x".repeat(2900)))] }).assistant("r2", { read: 90000 });
+  const summary = run([s]);
+  assert.equal(summary.missingBlobs, 40);
+  assert.ok(category(summary, "unresolved messages").share > 0.9, "the hole carries the cost");
+  assert.ok(category(summary, "user messages").share < 0.05, "the one known message does not");
+  assert.equal(summary.charsPerToken.median, undefined); // incomplete requests do not vouch for the method
+});
+
+test("counts a call once when two session files repeat it", () => {
+  const old = () => new Session("2.1.290").add({ type: "assistant", timestamp: at(0), message: { id: "msg_same", model: OPUS, content: [], usage: usageOf({ fresh: 1000 }) } });
+  assert.equal(run([old(), old()]).unattributedMessages, 1);
+
+  const recorded = () => {
+    const s = new Session().shape("shape", [{ name: "Bash", description: "b".repeat(100) }], ["system"]);
+    return s.request("same-request", { tail: [s.blob(text("hi"))] }).assistant("same-request", { write1h: 1000 });
+  };
+  const summary = run([recorded(), recorded()]);
+  assert.equal(summary.requests, 1);
+  near(summary.totalWeighted, 1000 * 8 * M, "total");
+});
+
+test("reads provider-wrapped model ids without keeping the wrapper", () => {
+  const arn = "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-opus-4-6-v1:0";
+  for (const options of [{}, { redact: true }]) {
+    const summary = run([new Session().assistant(null, { fresh: 1e6 }, { model: arn })], options);
+    near(summary.totalWeighted, 5, "priced as Opus 4.6");
+    assert.deepEqual(summary.models, { "claude-opus-4-6": 1 });
+    assert.ok(!JSON.stringify(summary).includes("123456789012"));
+  }
+  assert.deepEqual(run([new Session().assistant(null, { fresh: 1e6 }, { model: "claude-opus-4-5@20251101" })]).models, { "claude-opus-4-5": 1 });
+});
+
+test("prices cache writes when the log has the split but not the total", () => {
+  const s = new Session().add({ type: "assistant", timestamp: at(0), message: { id: "m1", model: OPUS, content: [], usage: { cache_creation: { ephemeral_1h_input_tokens: 1000, ephemeral_5m_input_tokens: 400 } } } });
+  near(run([s]).totalWeighted, (1000 * 8 + 400 * 5) * M, "total");
+});
+
+test("logs with no usage produce zeros, not NaN", () => {
+  const s = new Session().shape("shape", [], []);
+  s.request("r1", { tail: [] }).assistant("r1", {});
+  s.assistant(null, {}, { model: "claude-haiku-5-5" });
+  const summary = run([s], { debug: true });
+  assertFinite(summary);
+  assert.equal(summary.totalWeighted, 0);
+});
+
+test("only real headings become section names", () => {
+  const system = ["# Rules", "```bash", "# cat /Users/bob/secret.key", "## not a heading either", "```", "# MCP Server Instructions", "## jira", "use it well", "## Usage notes", "more"].join("\n");
+  const s = new Session().add({ type: "attachment", attachment: { type: "mcp_instructions_delta", addedNames: ["jira"] } });
+  s.shape("shape", [], [system]).request("r1", { tail: [s.blob(text("hi"))] }).assistant("r1", { write1h: 500 });
+  const summary = run([s]);
+  assert.deepEqual(category(summary, "system prompt").subs.map((x) => x.name).sort(), ["MCP Server Instructions", "MCP instructions: jira", "Rules"].sort());
+  assert.ok(!JSON.stringify(summary).includes("secret.key"));
+});
+
+test("survives records with missing or oddly shaped fields", () => {
+  const s = new Session();
+  s.lines.push("null", "42", JSON.stringify({ type: "api-request-blob", hash: "h", message: null }));
+  s.add({ type: "api-request-shape", shapeHash: "no-fields", shape: {} });
+  s.add({ type: "api-request-shape", shapeHash: "odd", shape: { tools: [{ description: "nameless" }, null], system: "a plain string" } });
+  s.add({ type: "api-request", id: "no-tail", shapeHash: "no-fields" });
+  s.add({ type: "api-request", id: "odd", shapeHash: "odd", tail: [s.blob({ role: "user", content: [null, { type: "text", text: "hi" }] })] });
+  s.add({ type: "assistant", requestRef: "no-tail", message: { id: "m1", model: null, content: "a string", usage: usageOf({ fresh: 10 }) } });
+  s.add({ type: "assistant", requestRef: "odd", message: { id: "m2", content: [null], usage: usageOf({ read: 100 }) } });
+  s.add({ type: "assistant", message: { id: "m3", usage: {} } });
+  const summary = run([s], { debug: true });
+  assertFinite(summary);
+  assert.equal(summary.requests, 2);
+  assert.deepEqual(summary.models, { unknown: 3 });
+});
+
+test("one unreadable session does not lose the others", () => {
+  const good = new Session().assistant(null, { fresh: 100 });
+  const root = mkdtempSync(join(tmpdir(), "quotopsy-test-"));
+  writeFileSync(join(root, "good.jsonl"), good.lines.join("\n"));
+  writeFileSync(join(root, "locked.jsonl"), good.lines.join("\n"));
+  chmodSync(join(root, "locked.jsonl"), 0); // reading it throws
+  const summary = analyze(root);
+  assert.equal(summary.files, 2);
+  assert.equal(summary.filesFailed, 1);
+  near(summary.totalWeighted, 100 * 4 * M, "total");
 });

@@ -18,22 +18,25 @@ import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 // HYPOTHESIS: usage is weighted at published API prices, so one unit is one
 // API-equivalent dollar. Whether weekly limits weight token types and models
 // the same way is unpublished.
 // Per model: [input $/MTok, cache read $/MTok]. Output is 5x input, cache
-// writes are 1.25x (5 min) and 2x (1 h) input. Prices as of 2026-10.
+// writes are 1.25x (5 min) and 2x (1 h) input. From Anthropic's pricing page,
+// checked 2026-11-10.
 const PRICES = {
-  "claude-fable-5-1": [10, 0.25], "claude-mythos-5-1": [10, 0.25], "claude-fable-5": [10, 1], "claude-mythos-5": [10, 1],
+  "claude-fable-5-2": [8, 0.2], "claude-mythos-5-2": [8, 0.2], "claude-fable-5-1": [10, 0.25], "claude-mythos-5-1": [10, 0.25], "claude-fable-5": [10, 1], "claude-mythos-5": [10, 1],
   "claude-opus-5-5": [4, 0.2], "claude-opus-5": [5, 0.5], "claude-opus-4-8": [5, 0.5], "claude-opus-4-7": [5, 0.5], "claude-opus-4-6": [5, 0.5], "claude-opus-4-5": [5, 0.5],
-  "claude-sonnet-5-5": [2, 0.2], "claude-sonnet-5": [2, 0.2], "claude-sonnet-4-6": [3, 0.3], "claude-sonnet-4-5": [3, 0.3],
+  "claude-opus-4-1": [15, 1.5], "claude-opus-4": [15, 1.5],
+  "claude-sonnet-5-5": [2, 0.1], "claude-sonnet-5": [2, 0.2], "claude-sonnet-4-6": [3, 0.3], "claude-sonnet-4-5": [3, 0.3], "claude-sonnet-4": [3, 0.3],
   "claude-haiku-5-5": [0.1, 0.01], "claude-haiku-4-5": [1, 0.1],
 };
 // Models missing from the table are priced like the newest listed model of
 // the same family, and reported so the reader knows.
-const FAMILY = { fable: "claude-fable-5-1", mythos: "claude-mythos-5-1", opus: "claude-opus-5-5", sonnet: "claude-sonnet-5-5", haiku: "claude-haiku-5-5" };
+const FAMILY = { fable: "claude-fable-5-2", mythos: "claude-mythos-5-2", opus: "claude-opus-5-5", sonnet: "claude-sonnet-5-5", haiku: "claude-haiku-5-5" };
 const MCP = "MCP server: ";
 const isMcp = (name) => name.startsWith("mcp__");
 const count = (map, key) => map.set(key, (map.get(key) ?? 0) + 1);
@@ -61,30 +64,43 @@ function blockChars(b) {
 const sorted = (v) => Array.isArray(v) ? v.map(sorted) : v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sorted(v[k])])) : v;
 export const hashMessage = (m) => createHash("sha256").update(JSON.stringify(sorted(m))).digest("hex");
 
+// The public model name inside a logged model id. Drops date suffixes and
+// provider wrappers such as Bedrock ARNs, which can carry an account number.
+const MODEL_ID = /claude-(?:fable|mythos|opus|sonnet|haiku)-\d+(?:-\d{1,2})?(?!\d)/;
+
 function splitUsage(u) {
   const write1h = u.cache_creation?.ephemeral_1h_input_tokens ?? 0;
-  const write = u.cache_creation_input_tokens ?? 0;
+  // Older logs only have the total; treat what is not one-hour as five-minute.
+  const write5m = u.cache_creation?.ephemeral_5m_input_tokens ?? Math.max(0, (u.cache_creation_input_tokens ?? 0) - write1h);
+  const write = write1h + write5m;
   const output = u.output_tokens ?? 0;
   const thinking = Math.min(output, u.output_tokens_details?.thinking_tokens ?? 0);
-  return { fresh: u.input_tokens ?? 0, read: u.cache_read_input_tokens ?? 0, write, write1h, write5m: write - write1h, output, thinking };
+  return { fresh: u.input_tokens ?? 0, read: u.cache_read_input_tokens ?? 0, write, write1h, write5m, output, thinking };
 }
 
 // Analyse every session log under `root` and return the summary object.
 // `onProgress(done, total)` is called before each file is read.
 export function analyze(root, { redact = false, debug: debugOn = false, onProgress = () => {} } = {}) {
   const assumedPricing = new Map(); // model -> model whose prices were used
-  function rates(model = "", usage = {}) {
-    const id = model.replace(/-\d{8}$/, "");
+  const modelName = (model) => MODEL_ID.exec(model ?? "")?.[0] ?? (model ? alias("model", String(model)) : "unknown");
+  function rates(model, usage = {}) {
+    const id = modelName(model);
     let key = id in PRICES ? id : null;
     if (!key) {
-      key = FAMILY[Object.keys(FAMILY).find((f) => id.includes(f))] ?? "claude-opus-5-5";
-      assumedPricing.set(model, key);
+      key = FAMILY[Object.keys(FAMILY).find((f) => String(model ?? "").includes(f))] ?? "claude-opus-5-5";
+      assumedPricing.set(id, key);
     }
     const [input, read] = PRICES[key];
-    const per = (usage.speed === "fast" ? 2 : 1) / 1e6; // fast mode bills at 2x
+    let per = 1e-6;
+    if (usage.speed === "fast") per *= 2; // fast mode bills at 2x
+    if (usage.inference_geo === "us") per *= 1.1; // US-only inference surcharge
+    // Haiku 5.5 bills 5x on requests whose prompt is over 100,000 tokens.
+    const prompt = (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0);
+    if (key === "claude-haiku-5-5" && prompt > 100000) per *= 5;
     return { fresh: input * per, write5m: 1.25 * input * per, write1h: 2 * input * per, read: read * per, output: 5 * input * per };
   }
 
+  const mcpServers = new Set(); // servers the log says injected instructions
   // Same name -> same placeholder, numbered per kind in order of appearance.
   const aliases = new Map(), aliasCounts = new Map();
   const PUBLIC_HEADINGS = new Set(["Environment", "Environment update"]); // written by Claude Code itself
@@ -110,17 +126,21 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
   // Only heading text is kept, never the body.
   function sections(text) {
     const out = [];
-    let label = "(no heading)", inMcp = false, chars = 0;
+    let label = "(no heading)", inMcp = false, inFence = false, chars = 0;
     const flush = () => { if (chars) out.push([label, chars]); chars = 0; };
     for (const line of text.split("\n")) {
-      const top = /^# (.+)/.exec(line), sub = /^## (.+)/.exec(line);
+      // A "# ..." line inside a code fence is a comment, not a heading.
+      if (/^\s*(```|~~~)/.test(line)) inFence = !inFence;
+      const top = !inFence && /^# (.+)/.exec(line), sub = !inFence && /^## (.+)/.exec(line);
       // A <tag> on its own line opens a block; its closing tag ends the block
       // without handing the text that follows to the previous heading.
       const open = /^<([a-z][\w-]*)>\s*$/.exec(line), close = /^<\/([a-z][\w-]*)>\s*$/.exec(line);
       if (open) { flush(); inMcp = false; label = alias("section", `<${open[1]}>`); }
       else if (close) { chars += line.length + 1; flush(); label = "(no heading)"; continue; }
       else if (top) { flush(); inMcp = top[1].startsWith("MCP Server Instructions"); label = alias("section", top[1].slice(0, 40)); }
-      else if (sub && inMcp) { flush(); label = "MCP instructions: " + alias("server", sub[1].slice(0, 40)); }
+      // A server's own instructions may contain "## ..." lines; when the log
+      // names the servers, only those start a new one.
+      else if (sub && inMcp && (!mcpServers.size || mcpServers.has(sub[1].trim()))) { flush(); label = "MCP instructions: " + alias("server", sub[1].slice(0, 40)); }
       chars += line.length + 1;
     }
     flush();
@@ -129,7 +149,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
 
   // One logged message -> [category, sub, chars] segments, in prompt order.
   function blobSegments(msg, toolNames) {
-    const blocks = typeof msg.content === "string" ? [{ type: "text", text: msg.content }] : msg.content ?? [];
+    const blocks = typeof msg.content === "string" ? [{ type: "text", text: msg.content }] : (Array.isArray(msg.content) ? msg.content : []).filter((b) => b && typeof b === "object");
     return blocks.flatMap((b) => {
       const chars = blockChars(b);
       if (msg.role === "system") return sections(b.text ?? "").map(([s, c]) => ["injected system messages", s, c]);
@@ -151,10 +171,11 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       if (!line) continue;
       let o;
       try { o = JSON.parse(line); } catch { continue; }
+      if (!o || typeof o !== "object") continue;
       count(recordTypes, String(o.type));
-      if (o.type === "api-request-blob") blobs.set(o.hash, o.message);
-      else if (o.type === "api-request-shape") shapes.set(o.shapeHash, o.shape);
-      else if (o.type === "api-request") requests.push(o);
+      if (o.type === "api-request-blob") { if (o.message && typeof o.message === "object") blobs.set(o.hash, o.message); }
+      else if (o.type === "api-request-shape") { if (o.shape && typeof o.shape === "object") shapes.set(o.shapeHash, o.shape); }
+      else if (o.type === "api-request") { if (o.id) requests.push(o); }
       else if (o.type === "attachment") {
         // Context Claude Code injects by itself: skill and agent listings,
         // MCP instructions, memory and instruction files. Sizes only.
@@ -162,14 +183,16 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
         a.count++;
         for (const r of Array.isArray(o.rendered) ? o.rendered : []) a.chars += typeof r?.content === "string" ? r.content.length : 0;
         attachments.set(o.attachment?.type ?? "unknown", a);
+        if (o.attachment?.type === "mcp_instructions_delta" && Array.isArray(o.attachment.addedNames)) for (const n of o.attachment.addedNames) mcpServers.add(String(n).trim());
       }
       else if (o.type === "assistant" && o.message?.usage) {
         // One record per content block, each repeating the message's usage.
         const key = o.requestRef ?? null;
-        if (o.message.model?.startsWith("<")) continue; // synthetic local message, not an API call
-        (key ? responses : orphans).set(key ?? o.message.id, { usage: o.message.usage, model: o.message.model, version: o.version, sidechain: !!o.isSidechain, ts: o.timestamp, thread: o.isSidechain ? `agent ${o.agentId ?? ""}` : "main" });
-        for (const b of o.message.content ?? []) if (b.type === "tool_use") toolNames.set(b.id, b.name);
-        turns.set(o.message.id, [...(turns.get(o.message.id) ?? []), ...(o.message.content ?? [])]);
+        if (String(o.message.model ?? "").startsWith("<")) continue; // synthetic local message, not an API call
+        const content = (Array.isArray(o.message.content) ? o.message.content : []).filter((b) => b && typeof b === "object");
+        (key ? responses : orphans).set(key ?? o.message.id, { id: o.message.id, usage: o.message.usage, model: o.message.model, version: o.version, sidechain: !!o.isSidechain, ts: o.timestamp, thread: o.isSidechain ? `agent ${o.agentId ?? ""}` : "main" });
+        for (const b of content) if (b.type === "tool_use") toolNames.set(b.id, String(b.name ?? "unknown"));
+        turns.set(o.message.id, [...(turns.get(o.message.id) ?? []), ...content]);
         run = [];
       } else if (o.type === "user" && o.message?.content) {
         const c = o.message.content;
@@ -190,6 +213,9 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       const h = hashMessage(m);
       if (!blobs.has(h)) blobs.set(h, m);
     }
+    // A response whose request was not logged is usage without a known cause.
+    const logged = new Set(requests.map((r) => r.id));
+    for (const [ref, res] of responses) if (!logged.has(ref)) { orphans.set(`ref ${ref}`, res); responses.delete(ref); }
     return { blobs, shapes, requests, responses, orphans, toolNames, recordTypes };
   }
 
@@ -201,7 +227,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     cats.set(cat, c);
   };
 
-  const stats = { files: 0, requests: 0, noResponse: 0, unattributed: 0, missingBlobs: 0, charsPerToken: [], models: new Map(), versions: new Map(), sources: new Map(), first: null, last: null };
+  const stats = { files: 0, failedFiles: 0, requests: 0, noResponse: 0, unattributed: 0, missingBlobs: 0, charsPerToken: [], models: new Map(), versions: new Map(), sources: new Map(), first: null, last: null };
   // Claude Code version -> requests that could and could not be attributed
   const coverage = (version, key) => {
     const v = stats.versions.get(version ?? "unknown") ?? { attributed: 0, unattributed: 0 };
@@ -235,7 +261,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
   const debug = { recordTypes: new Map(), unattributed: new Map(), offRequests: [], unknownRebuilds: [], offRequestCount: 0 };
   // Content block types of a message, including those nested in tool results.
   function blockTypes(msg, into) {
-    for (const b of Array.isArray(msg.content) ? msg.content : [{ type: "text" }]) {
+    for (const b of Array.isArray(msg.content) ? msg.content.filter((b) => b && typeof b === "object") : [{ type: "text" }]) {
       count(into, `${msg.role}:${b.type}`);
       if (b.type === "tool_result" && Array.isArray(b.content)) for (const inner of b.content) count(into, `tool_result>${inner.type}`);
     }
@@ -243,18 +269,32 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
 
   const files = findJsonl(root);
 
+  // Forked or copied sessions can repeat records; count each call once.
+  const counted = new Set();
+  const answered = new Map(); // request id -> what a follow-up needs to compare against
+  // Typical characters per token, from requests reconstructed in full.
+  const clean = { chars: 0, tokens: 0 };
+  const UNRESOLVED = "unresolved messages";
+
   for (const file of files) {
     onProgress(stats.files, files.length);
     stats.files++;
+    // One unreadable session should not lose the rest.
+    try { readSession(file); } catch { stats.failedFiles++; }
+  }
+
+  function readSession(file) {
     const s = parseSession(file);
     for (const name of s.toolNames.values()) { count(calls, toolLabel(name)); count(calls, toolGroup(name)); }
 
     // Sessions without request records: usage is known, its cause is not.
     for (const [type, n] of s.recordTypes) debug.recordTypes.set(type, (debug.recordTypes.get(type) ?? 0) + n);
     const lastOrphan = new Map(); // thread -> its previous message
-    for (const { usage, model, version, sidechain, ts, thread } of s.orphans.values()) {
+    for (const { id, usage, model, version, sidechain, ts, thread } of s.orphans.values()) {
+      if (id && counted.has(id)) continue;
+      counted.add(id);
       coverage(version, "unattributed");
-      count(stats.models, model);
+      count(stats.models, modelName(model));
       seen(ts);
       count(debug.unattributed, `version ${version ?? "unknown"}, ${sidechain ? "subagent" : "main"} thread, file ${s.requests.length ? "has" : "has no"} request records`);
       const u = splitUsage(usage), w = rates(model, usage);
@@ -266,7 +306,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       bump("output", "thinking", "output", u.thinking, u.thinking * w.output);
       bump("output", "text and tool calls", "output", u.output - u.thinking, (u.output - u.thinking) * w.output);
       const writeCost = u.write5m * w.write5m + u.write1h * w.write1h;
-      spend(byModel, model, u.fresh * w.fresh + writeCost + u.read * w.read, u.output * w.output);
+      spend(byModel, modelName(model), u.fresh * w.fresh + writeCost + u.read * w.read, u.output * w.output);
       spend(byThread, sidechain ? "subagent: (type not logged)" : "main thread", u.fresh * w.fresh + writeCost + u.read * w.read, u.output * w.output);
 
       // Without request records, usage alone still shows a cache lost to
@@ -283,16 +323,20 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
 
     // Requests are delta-encoded: messages = base's first `keep` + `tail`.
     const msgLists = new Map();
-    const answered = new Map(); // request id -> what a follow-up needs to compare against
     const lastOf = new Map(); // first message hash -> same, for the conversation's latest request
     for (const req of s.requests) {
-      const baseLen = (msgLists.get(req.base) ?? []).length;
-      const hashes = [...(msgLists.get(req.base) ?? []).slice(0, req.keep), ...req.tail];
+      const baseList = msgLists.get(req.base), tail = Array.isArray(req.tail) ? req.tail : [], keep = req.keep ?? 0;
+      const baseLen = (baseList ?? []).length;
+      // Messages kept from a base request that is not in this log.
+      const lostPrefix = req.base && !baseList ? keep : 0;
+      const hashes = [...(baseList ?? []).slice(0, keep), ...tail];
       msgLists.set(req.id, hashes);
       const res = s.responses.get(req.id);
       if (!res) { stats.noResponse++; continue; }
+      if (counted.has(req.id)) continue;
+      counted.add(req.id);
       stats.requests++;
-      count(stats.models, res.model);
+      count(stats.models, modelName(res.model));
       const source = redact ? threadOf(req.querySource) : req.querySource ?? "unknown";
       count(stats.sources, source);
       coverage(req.version, "attributed");
@@ -302,33 +346,55 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       bump("output", "thinking", "output", u.thinking, u.thinking * w.output);
       bump("output", "text and tool calls", "output", u.output - u.thinking, (u.output - u.thinking) * w.output);
       const inputCost = u.fresh * w.fresh + u.write5m * w.write5m + u.write1h * w.write1h + u.read * w.read;
-      spend(byModel, res.model, inputCost, u.output * w.output);
+      spend(byModel, modelName(res.model), inputCost, u.output * w.output);
       spend(byThread, threadOf(req.querySource), inputCost, u.output * w.output);
 
       // Prompt order is tools, system, messages; the cache covers a prefix of it.
-      const shape = s.shapes.get(req.shapeHash) ?? { tools: [], system: [] };
-      for (const g of new Set(shape.tools.map((t) => toolGroup(t.name)))) count(loadedIn, g);
+      const shape = s.shapes.get(req.shapeHash) ?? {};
+      const tools = (Array.isArray(shape.tools) ? shape.tools : []).filter((t) => t && typeof t === "object").map((t) => [String(t.name ?? "unknown"), t]);
+      const system = typeof shape.system === "string" ? [{ text: shape.system }] : Array.isArray(shape.system) ? shape.system : [];
+      for (const g of new Set(tools.map(([name]) => toolGroup(name)))) count(loadedIn, g);
       const segs = [
-        ...shape.tools.map((t) => [toolGroup(t.name), toolLabel(t.name), JSON.stringify(t).length]),
-        ...shape.system.flatMap((b) => sections(b.text ?? "").map(([sec, c]) => ["system prompt", sec, c])),
+        ...tools.map(([name, t]) => [toolGroup(name), toolLabel(name), JSON.stringify(t).length]),
+        ...system.flatMap((b) => sections(String(b?.text ?? "")).map(([sec, c]) => ["system prompt", sec, c])),
       ];
-      let missing = 0;
+      // A message that cannot be found leaves a hole of unknown size.
+      let missing = lostPrefix;
+      if (lostPrefix) segs.push([UNRESOLVED, "kept from a request not in the log", null]);
       for (const h of hashes) {
         const m = s.blobs.get(h);
-        if (m) segs.push(...blobSegments(m, s.toolNames)); else missing++;
+        if (m) segs.push(...blobSegments(m, s.toolNames));
+        else { missing++; segs.push([UNRESOLVED, "message not in the log", null]); }
       }
       stats.missingBlobs += missing;
       const prompt = u.fresh + u.write + u.read;
+      if (missing) {
+        // ESTIMATE: size the holes from the usual characters-per-token ratio,
+        // so their cost is not spread over the messages that were found.
+        const known = segs.reduce((n, seg) => n + (seg[2] ?? 0), 0);
+        const holes = segs.filter((seg) => seg[2] === null);
+        const gap = Math.max(0, prompt * (clean.tokens ? clean.chars / clean.tokens : 2.9) - known);
+        for (const seg of holes) seg[2] = gap / holes.length;
+      }
       const chars = segs.reduce((n, seg) => n + seg[2], 0);
-      if (!chars || !prompt) continue;
-      stats.charsPerToken.push(chars / prompt);
-      if (debugOn && (chars / prompt < 2 || chars / prompt > 4.5) && debug.offRequestCount++ < DEBUG_CAP) {
+      const attributable = chars > 0 && prompt > 0;
+      if (prompt > 0 && !attributable) {
+        // Nothing of the prompt could be rebuilt: keep its cost, without a cause.
+        bump("unattributed input", "cache read", "read", u.read, u.read * w.read);
+        bump("unattributed input", "cache write", "write", u.write, u.write5m * w.write5m + u.write1h * w.write1h);
+        bump("unattributed input", "fresh input", "fresh", u.fresh, u.fresh * w.fresh);
+      }
+      if (attributable && !missing) {
+        stats.charsPerToken.push(chars / prompt);
+        clean.chars += chars; clean.tokens += prompt;
+      }
+      if (debugOn && attributable && !missing && (chars / prompt < 2 || chars / prompt > 4.5) && debug.offRequestCount++ < DEBUG_CAP) {
         const byCat = new Map(), types = new Map();
         for (const [cat, , c] of segs) byCat.set(cat, (byCat.get(cat) ?? 0) + c);
         for (const h of hashes) if (s.blobs.has(h)) blockTypes(s.blobs.get(h), types);
         debug.offRequests.push({
-          charsPerToken: chars / prompt, version: req.version, source, model: res.model, usage: u,
-          messages: hashes.length, missingMessages: missing, keep: req.keep, tail: req.tail.length, hasBase: !!req.base, baseKnown: msgLists.has(req.base),
+          charsPerToken: chars / prompt, version: req.version, source, model: modelName(res.model), usage: u,
+          messages: hashes.length, missingMessages: missing, keep, tail: tail.length, hasBase: !!req.base, baseKnown: !!baseList,
           charsByCategory: Object.fromEntries(byCat), blockTypes: Object.fromEntries(types),
           largestSegments: [...segs].sort((a, b) => b[2] - a[2]).slice(0, 3).map(([cat, sub, c]) => ({ category: cat, sub, chars: c })),
         });
@@ -336,7 +402,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
 
       // ESTIMATE: scale chars to the request's real token total, then charge
       // each segment by position: first `read` tokens, then `write`, then fresh.
-      const perChar = prompt / chars;
+      const perChar = attributable ? prompt / chars : 0;
       const writeRate = u.write ? (u.write5m * w.write5m + u.write1h * w.write1h) / u.write : 0;
       const bands = [["read", u.read, w.read], ["write", u.write, writeRate], ["fresh", u.fresh, w.fresh]];
       let pos = 0;
@@ -365,14 +431,14 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
         // An expired cache explains the rebuild whatever else changed.
         const cause = gapMin > prev.ttlMin ? "idle longer than the cache lifetime"
           : prev.model !== res.model ? "model switched mid-session"
-          : req.keep < baseLen ? "conversation edited or compacted"
+          : keep < baseLen ? "conversation edited or compacted"
           : req.shapeHash !== prev.shapeHash ? "tool list or system prompt changed"
           : "unknown";
         rebuilds.push({ cause, tokens: lost, wasted: lost * (writeRate - w.read), at: req.timestamp, gapMin: Math.round(gapMin) });
         if (debugOn && cause === "unknown" && debug.unknownRebuilds.length < DEBUG_CAP) {
           debug.unknownRebuilds.push({
             version: req.version, source, gapMin, previousPrompt: prev.prompt, usage: u, ttlMin: prev.ttlMin,
-            keep: req.keep, baseMessages: baseLen, tail: req.tail.length, matchedBy: answered.has(req.base) ? "base" : "first message",
+            keep, baseMessages: baseLen, tail: tail.length, matchedBy: answered.has(req.base) ? "base" : "first message",
           });
         }
       }
@@ -382,9 +448,10 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
   }
 
   const total = [...cats.values()].reduce((n, c) => n + c.weighted, 0);
+  const share = (x) => (total ? x / total : 0);
   const rows = [...cats.entries()].map(([name, c]) => ({
-    name, read: c.read, write: c.write, fresh: c.fresh, output: c.output, weighted: c.weighted, share: c.weighted / total, calls: calls.get(name) ?? null,
-    subs: [...c.subs.entries()].map(([sub, w]) => ({ name: sub, share: w / total, calls: calls.get(sub) ?? null })).sort((a, b) => b.share - a.share),
+    name, read: c.read, write: c.write, fresh: c.fresh, output: c.output, weighted: c.weighted, share: share(c.weighted), calls: calls.get(name) ?? null,
+    subs: [...c.subs.entries()].map(([sub, w]) => ({ name: sub, share: share(w), calls: calls.get(sub) ?? null })).sort((a, b) => b.share - a.share),
   })).sort((a, b) => b.weighted - a.weighted);
   const row = (name) => rows.find((r) => r.name === name);
 
@@ -394,14 +461,14 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
   for (const r of rebuilds) byCause.set(r.cause, [...(byCause.get(r.cause) ?? []), r]);
   const rebuildFix = {
     "model switched mid-session": "Pick the model before the first message, or switch in a new session.",
-    "idle longer than the cache lifetime": "After a long break, start a new session instead of resuming a long one.",
+    "idle longer than the cache lifetime": "Before a long break, compact the conversation, or start a new session afterwards if you do not need the history. The saving is smaller than this figure when you do need it.",
     "conversation edited or compacted": "Compact at a natural break, before the conversation is large.",
     "tool list or system prompt changed": "Connect MCP servers before the session starts, not during it.",
     "unknown": "No fix identified yet.",
   };
   for (const [cause, list] of byCause) {
     const wasted = list.reduce((n, r) => n + r.wasted, 0);
-    findings.push({ effect: wasted / total, what: `Cache rebuilt ${list.length}x: ${cause}; ${Math.round(list.reduce((n, r) => n + r.tokens, 0) / 1000)}k tokens paid for twice`, fix: rebuildFix[cause] });
+    findings.push({ effect: share(wasted), what: `Cache rebuilt ${list.length}x: ${cause}; ${Math.round(list.reduce((n, r) => n + r.tokens, 0) / 1000)}k tokens paid for twice`, fix: rebuildFix[cause] });
   }
   for (const r of rows.filter((r) => r.name.startsWith(MCP))) {
     const server = r.name.slice(MCP.length);
@@ -424,19 +491,20 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
   findings.sort((a, b) => b.effect - a.effect);
 
   const ranked = (map) => [...map.entries()]
-    .map(([name, e]) => ({ name, requests: e.requests, cost: e.cost, share: e.cost / total, costPerRequest: e.cost / e.requests, outputShare: e.output / e.cost }))
+    .map(([name, e]) => ({ name, requests: e.requests, cost: e.cost, share: share(e.cost), costPerRequest: e.cost / e.requests, outputShare: e.cost ? e.output / e.cost : 0 }))
     .sort((a, b) => b.cost - a.cost);
   const cpt = stats.charsPerToken.sort((a, b) => a - b);
   const q = (p) => cpt[Math.min(cpt.length - 1, Math.floor(p * cpt.length))];
   // Requests whose reconstructed prompt is far from the billed token count.
   const offRatio = cpt.filter((x) => x < 2 || x > 4.5).length / (cpt.length || 1);
   const summary = {
-    contains: "Token totals, counts, timestamps and model names only. No prompts, code, file paths or tool output. "
-      + (redact ? "MCP server names, MCP tool names and prompt section headings are replaced with placeholders." : "Includes MCP server names, tool names and prompt section headings; rerun with --redact to replace them."),
+    contains: "Token totals, counts, timestamps and model names. No message text or tool output. "
+      + (redact ? "Names of MCP servers, MCP tools and custom subagents, and prompt section headings, are replaced with placeholders."
+        : "Includes names of MCP servers, tools and custom subagents, and prompt section headings (lines that start with #); rerun with --redact to replace them."),
     redacted: redact,
     unit: "API-equivalent US dollars at published prices (hypothesis: limits may weight usage differently)",
     prices: PRICES, assumedPricing: Object.fromEntries(assumedPricing),
-    files: stats.files, requests: stats.requests, requestsWithoutResponse: stats.noResponse, unattributedMessages: stats.unattributed, missingBlobs: stats.missingBlobs,
+    files: stats.files, filesFailed: stats.failedFiles, requests: stats.requests, requestsWithoutResponse: stats.noResponse, unattributedMessages: stats.unattributed, missingBlobs: stats.missingBlobs,
     from: stats.first, to: stats.last, models: Object.fromEntries(stats.models),
     charsPerToken: { min: cpt[0], p5: q(0.05), median: q(0.5), p95: q(0.95), max: cpt[cpt.length - 1], shareOutside2to4_5: offRatio },
     claudeCodeVersions: Object.fromEntries(stats.versions), querySources: Object.fromEntries(stats.sources),
@@ -532,6 +600,7 @@ function printReport(summary, redact) {
     ...Object.entries(summary.assumedPricing).map(([model, as]) => `No published price known for ${model}; priced as ${as}.`),
     `Check: ${summary.charsPerToken.median?.toFixed(2)} characters per token (median), ${(summary.charsPerToken.shareOutside2to4_5 * 100).toFixed(1)}% of requests reconstructed poorly, ${num(summary.unattributedMessages)} requests without a request record.`,
     `Claude Code versions: ${Object.entries(summary.claudeCodeVersions).map(([v, c]) => `${v} (${num(c.attributed + c.unattributed)})`).join(", ")}.`,
+    ...(summary.filesFailed ? [`${num(summary.filesFailed)} session files could not be read and are left out.`] : []),
     "Nothing left this machine. For a shareable summary: node prototype.mjs --json --redact",
   ];
   for (const note of notes) wrap(note, "  · ", "    ", (t) => out(DIM, t));

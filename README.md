@@ -62,10 +62,12 @@ content.
   log the request records it relies on, so their usage shows as
   "unattributed"; cache rebuilds after idle gaps are still detected from
   usage alone. Checked on logs from 2.1.300 through 2.1.322.
-- Usage is weighted at published API prices per model (as of 2026-10), so
+- Usage is weighted at published API prices per model (checked 2026-11-10), so
   shares are shares of API-equivalent cost. How weekly limits weight token
   types and models is not published.
 - A model missing from the price table is priced like the newest listed model
   of its family, and the report says so.
+- A message the log does not contain is shown as "unresolved messages" and
+  sized from the usual characters-per-token ratio.
 - Prompt text is split at headings and standalone `<tag>` blocks. Text that
   follows a heading with no later heading or tag is credited to that heading.
