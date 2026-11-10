@@ -15,6 +15,8 @@ calls, and it's one file you can read first.
 **What I'd get:** token totals, counts, timestamps and model names. No
 prompts, code, file paths or tool output. With `--redact`, MCP server names,
 MCP tool names and prompt headings are replaced with placeholders.
+`--debug` adds sizes and counts for any requests the tool handled badly, so I
+can fix it without seeing your logs. It contains no message text either.
 
 **Steps** (needs Node 18 or newer):
 
@@ -22,7 +24,7 @@ MCP tool names and prompt headings are replaced with placeholders.
 2. Run:
 
    ```bash
-   node prototype.mjs --json --redact > summary.json
+   node prototype.mjs --json --redact --debug > summary.json
    ```
 
 3. Run this and tell me the version it prints:
@@ -36,4 +38,5 @@ MCP tool names and prompt headings are replaced with placeholders.
 If you're curious, `node prototype.mjs` on its own prints a readable report
 for you, with real names, that stays on your machine.
 
-Please don't run it on a work machine. Thanks!
+Please run it only on a personal machine with a personal Claude account, not
+on a work laptop or on logs from work sessions. Thanks!

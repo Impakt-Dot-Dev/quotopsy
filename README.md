@@ -24,6 +24,7 @@ node prototype.mjs
 | `[logs-dir]` | Logs to read. Defaults to `~/.claude/projects`. |
 | `--json` | Print the summary as JSON instead of a report. |
 | `--redact` | Replace MCP server names, MCP tool names and prompt section headings with placeholders. |
+| `--debug` | With `--json`, add structure-only diagnostics for requests the tool handled badly: record types, block types, sizes and counts. No message text. |
 
 To enforce "read these logs, no network" instead of trusting the code:
 
@@ -38,7 +39,7 @@ read outside `~/.claude`.
 ## Sharing a summary
 
 ```bash
-node prototype.mjs --json --redact > summary.json
+node prototype.mjs --json --redact --debug > summary.json
 ```
 
 The file holds token totals, counts, timestamps and model names. It holds no

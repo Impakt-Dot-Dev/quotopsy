@@ -7,6 +7,8 @@
 //
 // --redact replaces MCP server names, MCP tool names and prompt section
 // headings with numbered placeholders, for output that will be shared.
+// --debug adds structure-only diagnostics to the JSON (record types, block
+// types, sizes and counts for requests the tool handled badly). No text.
 //
 // Uses only node: builtins, so it also runs under
 //   deno run --allow-read=$HOME/.claude --deny-net prototype.mjs $HOME/.claude/projects
@@ -47,6 +49,7 @@ function rates(model = "", usage = {}) {
 const args = process.argv.slice(2);
 const asJson = args.includes("--json");
 const redact = args.includes("--redact");
+const debugOn = args.includes("--debug");
 const root = args.find((a) => !a.startsWith("--")) ?? join(homedir(), ".claude", "projects");
 
 function findJsonl(dir) {
@@ -135,10 +138,12 @@ function parseSession(file) {
   const turns = new Map(); // assistant message id -> merged content blocks
   const transcript = []; // messages only logged as transcript records
   let run = []; // user records since the last assistant record
+  const recordTypes = new Map();
   for (const line of readFileSync(file, "utf8").split("\n")) {
     if (!line) continue;
     let o;
     try { o = JSON.parse(line); } catch { continue; }
+    count(recordTypes, String(o.type));
     if (o.type === "api-request-blob") blobs.set(o.hash, o.message);
     else if (o.type === "api-request-shape") shapes.set(o.shapeHash, o.shape);
     else if (o.type === "api-request") requests.push(o);
@@ -146,7 +151,7 @@ function parseSession(file) {
       // One record per content block, each repeating the message's usage.
       const key = o.requestRef ?? null;
       if (o.message.model?.startsWith("<")) continue; // synthetic local message, not an API call
-      (key ? responses : orphans).set(key ?? o.message.id, { usage: o.message.usage, model: o.message.model, version: o.version });
+      (key ? responses : orphans).set(key ?? o.message.id, { usage: o.message.usage, model: o.message.model, version: o.version, sidechain: !!o.isSidechain });
       for (const b of o.message.content ?? []) if (b.type === "tool_use") toolNames.set(b.id, b.name);
       turns.set(o.message.id, [...(turns.get(o.message.id) ?? []), ...(o.message.content ?? [])]);
       run = [];
@@ -169,7 +174,7 @@ function parseSession(file) {
     const h = hashMessage(m);
     if (!blobs.has(h)) blobs.set(h, m);
   }
-  return { blobs, shapes, requests, responses, orphans, toolNames };
+  return { blobs, shapes, requests, responses, orphans, toolNames, recordTypes };
 }
 
 function splitUsage(u) {
@@ -199,14 +204,28 @@ const calls = new Map(); // tool group or tool name -> call count
 const loadedIn = new Map(); // tool group -> requests that carried its schemas
 const rebuilds = [];
 
+// Structure-only diagnostics for --debug. Sizes, counts and type names; the
+// only names are tool and section labels, which --redact replaces.
+const DEBUG_CAP = 50;
+const debug = { recordTypes: new Map(), unattributed: new Map(), offRequests: [], unknownRebuilds: [], offRequestCount: 0 };
+// Content block types of a message, including those nested in tool results.
+function blockTypes(msg, into) {
+  for (const b of Array.isArray(msg.content) ? msg.content : [{ type: "text" }]) {
+    count(into, `${msg.role}:${b.type}`);
+    if (b.type === "tool_result" && Array.isArray(b.content)) for (const inner of b.content) count(into, `tool_result>${inner.type}`);
+  }
+}
+
 for (const file of findJsonl(root)) {
   stats.files++;
   const s = parseSession(file);
   for (const name of s.toolNames.values()) { count(calls, toolLabel(name)); count(calls, toolGroup(name)); }
 
   // Sessions without request records: usage is known, its cause is not.
-  for (const { usage, model, version } of s.orphans.values()) {
+  for (const [type, n] of s.recordTypes) debug.recordTypes.set(type, (debug.recordTypes.get(type) ?? 0) + n);
+  for (const { usage, model, version, sidechain } of s.orphans.values()) {
     coverage(version, "unattributed");
+    count(debug.unattributed, `version ${version ?? "unknown"}, ${sidechain ? "subagent" : "main"} thread, file ${s.requests.length ? "has" : "has no"} request records`);
     const u = splitUsage(usage), w = rates(model, usage);
     const cat = "unattributed (no request record)";
     stats.unattributed++;
@@ -245,14 +264,27 @@ for (const file of findJsonl(root)) {
       ...shape.tools.map((t) => [toolGroup(t.name), toolLabel(t.name), JSON.stringify(t).length]),
       ...shape.system.flatMap((b) => sections(b.text ?? "").map(([sec, c]) => ["system prompt", sec, c])),
     ];
+    let missing = 0;
     for (const h of hashes) {
       const m = s.blobs.get(h);
-      if (m) segs.push(...blobSegments(m, s.toolNames)); else stats.missingBlobs++;
+      if (m) segs.push(...blobSegments(m, s.toolNames)); else missing++;
     }
+    stats.missingBlobs += missing;
     const prompt = u.fresh + u.write + u.read;
     const chars = segs.reduce((n, seg) => n + seg[2], 0);
     if (!chars || !prompt) continue;
     stats.charsPerToken.push(chars / prompt);
+    if (debugOn && (chars / prompt < 2 || chars / prompt > 4.5) && debug.offRequestCount++ < DEBUG_CAP) {
+      const byCat = new Map(), types = new Map();
+      for (const [cat, , c] of segs) byCat.set(cat, (byCat.get(cat) ?? 0) + c);
+      for (const h of hashes) if (s.blobs.has(h)) blockTypes(s.blobs.get(h), types);
+      debug.offRequests.push({
+        charsPerToken: chars / prompt, version: req.version, source: req.querySource, model: res.model, usage: u,
+        messages: hashes.length, missingMessages: missing, keep: req.keep, tail: req.tail.length, hasBase: !!req.base, baseKnown: msgLists.has(req.base),
+        charsByCategory: Object.fromEntries(byCat), blockTypes: Object.fromEntries(types),
+        largestSegments: [...segs].sort((a, b) => b[2] - a[2]).slice(0, 3).map(([cat, sub, c]) => ({ category: cat, sub, chars: c })),
+      });
+    }
 
     // ESTIMATE: scale chars to the request's real token total, then charge
     // each segment by position: first `read` tokens, then `write`, then fresh.
@@ -289,6 +321,12 @@ for (const file of findJsonl(root)) {
         : req.shapeHash !== prev.shapeHash ? "tool list or system prompt changed"
         : "unknown";
       rebuilds.push({ cause, tokens: lost, wasted: lost * (writeRate - w.read), at: req.timestamp, gapMin: Math.round(gapMin) });
+      if (debugOn && cause === "unknown" && debug.unknownRebuilds.length < DEBUG_CAP) {
+        debug.unknownRebuilds.push({
+          version: req.version, source: req.querySource, gapMin, previousPrompt: prev.prompt, usage: u, ttlMin: prev.ttlMin,
+          keep: req.keep, baseMessages: baseLen, tail: req.tail.length, matchedBy: answered.has(req.base) ? "base" : "first message",
+        });
+      }
     }
     answered.set(req.id, { prompt, ts: req.timestamp, model: res.model, shapeHash: req.shapeHash, ttlMin: u.write1h || !u.write ? 60 : 5 });
     lastOf.set(hashes[0], answered.get(req.id));
@@ -353,6 +391,13 @@ const summary = {
   claudeCodeVersions: Object.fromEntries(stats.versions), querySources: Object.fromEntries(stats.sources),
   totalWeighted: total, categories: rows, cacheRebuilds: rebuilds, findings,
 };
+if (debugOn) {
+  summary.debug = {
+    contains: "Structure only: record types, block types, sizes and counts. No message text.",
+    recordTypes: Object.fromEntries(debug.recordTypes), unattributed: Object.fromEntries(debug.unattributed),
+    offRequestsTotal: debug.offRequestCount, offRequests: debug.offRequests, unknownRebuilds: debug.unknownRebuilds,
+  };
+}
 
 if (asJson) {
   console.log(JSON.stringify(summary, null, 2));
