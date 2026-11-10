@@ -48,8 +48,9 @@ this and whether names were redacted.
 
 ## Limits
 
-- Tested on Claude Code 2.1.309 only. Older versions may not log the request
-  records it relies on; their usage shows as "unattributed".
+- Needs Claude Code 2.1.300 or newer for attribution. Older versions do not
+  log the request records it relies on, so their usage shows as
+  "unattributed". Checked on logs from 2.1.300 through 2.1.322.
 - Usage is weighted at published API prices per model (as of 2026-10), so
   shares are shares of API-equivalent cost. How weekly limits weight token
   types and models is not published.
