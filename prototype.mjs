@@ -103,11 +103,20 @@ function sections(text) {
   return out;
 }
 
+// Base64 image and document payloads are not tokenized as text. ESTIMATE:
+// drop the payload and count each as roughly 1,500 tokens' worth of chars.
+const MEDIA_CHARS = 4500;
+function blockChars(b) {
+  let media = 0;
+  const text = JSON.stringify(b, (k, v) => (k === "data" && typeof v === "string" && v.length > 1000 ? (media++, "") : v));
+  return text.length + media * MEDIA_CHARS;
+}
+
 // One logged message -> [category, sub, chars] segments, in prompt order.
 function blobSegments(msg, toolNames) {
   const blocks = typeof msg.content === "string" ? [{ type: "text", text: msg.content }] : msg.content ?? [];
   return blocks.flatMap((b) => {
-    const chars = JSON.stringify(b).length;
+    const chars = blockChars(b);
     if (msg.role === "system") return sections(b.text ?? "").map(([s, c]) => ["injected system messages", s, c]);
     if (msg.role === "assistant") return [["assistant history", b.type, chars]];
     if (b.type === "tool_result") return [["tool results", toolLabel(toolNames.get(b.tool_use_id) ?? "(unknown tool)"), chars]];
@@ -136,7 +145,8 @@ function parseSession(file) {
     else if (o.type === "assistant" && o.message?.usage) {
       // One record per content block, each repeating the message's usage.
       const key = o.requestRef ?? null;
-      (key ? responses : orphans).set(key ?? o.message.id, { usage: o.message.usage, model: o.message.model });
+      if (o.message.model?.startsWith("<")) continue; // synthetic local message, not an API call
+      (key ? responses : orphans).set(key ?? o.message.id, { usage: o.message.usage, model: o.message.model, version: o.version });
       for (const b of o.message.content ?? []) if (b.type === "tool_use") toolNames.set(b.id, b.name);
       turns.set(o.message.id, [...(turns.get(o.message.id) ?? []), ...(o.message.content ?? [])]);
       run = [];
@@ -179,7 +189,12 @@ const bump = (cat, sub, kind, tokens, weighted) => {
 };
 const count = (map, key) => map.set(key, (map.get(key) ?? 0) + 1);
 
-const stats = { files: 0, requests: 0, noResponse: 0, unattributed: 0, missingBlobs: 0, charsPerToken: [], models: new Map(), first: null, last: null };
+const stats = { files: 0, requests: 0, noResponse: 0, unattributed: 0, missingBlobs: 0, charsPerToken: [], models: new Map(), versions: new Map(), sources: new Map(), first: null, last: null };
+// Claude Code version -> requests that could and could not be attributed
+const coverage = (version, key) => {
+  const v = stats.versions.get(version ?? "unknown") ?? { attributed: 0, unattributed: 0 };
+  v[key]++; stats.versions.set(version ?? "unknown", v);
+};
 const calls = new Map(); // tool group or tool name -> call count
 const loadedIn = new Map(); // tool group -> requests that carried its schemas
 const rebuilds = [];
@@ -190,7 +205,8 @@ for (const file of findJsonl(root)) {
   for (const name of s.toolNames.values()) { count(calls, toolLabel(name)); count(calls, toolGroup(name)); }
 
   // Sessions without request records: usage is known, its cause is not.
-  for (const { usage, model } of s.orphans.values()) {
+  for (const { usage, model, version } of s.orphans.values()) {
+    coverage(version, "unattributed");
     const u = splitUsage(usage), w = rates(model, usage);
     const cat = "unattributed (no request record)";
     stats.unattributed++;
@@ -203,7 +219,8 @@ for (const file of findJsonl(root)) {
 
   // Requests are delta-encoded: messages = base's first `keep` + `tail`.
   const msgLists = new Map();
-  let prev = null;
+  const answered = new Map(); // request id -> what a follow-up needs to compare against
+  const lastOf = new Map(); // first message hash -> same, for the conversation's latest request
   for (const req of s.requests) {
     const baseLen = (msgLists.get(req.base) ?? []).length;
     const hashes = [...(msgLists.get(req.base) ?? []).slice(0, req.keep), ...req.tail];
@@ -212,6 +229,8 @@ for (const file of findJsonl(root)) {
     if (!res) { stats.noResponse++; continue; }
     stats.requests++;
     count(stats.models, res.model);
+    count(stats.sources, req.querySource ?? "unknown");
+    coverage(req.version, "attributed");
     stats.first = !stats.first || req.timestamp < stats.first ? req.timestamp : stats.first;
     stats.last = !stats.last || req.timestamp > stats.last ? req.timestamp : stats.last;
 
@@ -255,6 +274,11 @@ for (const file of findJsonl(root)) {
     // Reading back less than the previous prompt means the cache was lost
     // and part of the existing conversation had to be written again. The
     // waste is what those tokens cost above a normal cache read.
+    // Compare with the request this one extends, not the previous one in the
+    // file: subagents interleave their own conversations in the same log.
+    // A resumed session logs no base, so fall back to the conversation that
+    // starts with the same first message.
+    const prev = answered.get(req.base) ?? lastOf.get(hashes[0]);
     const lost = prev ? Math.min(u.write, prev.prompt - u.read) : 0;
     if (prev && u.read < 0.8 * prev.prompt && lost > 5000) {
       const gapMin = (Date.parse(req.timestamp) - Date.parse(prev.ts)) / 60000;
@@ -266,7 +290,8 @@ for (const file of findJsonl(root)) {
         : "unknown";
       rebuilds.push({ cause, tokens: lost, wasted: lost * (writeRate - w.read), at: req.timestamp, gapMin: Math.round(gapMin) });
     }
-    prev = { prompt, ts: req.timestamp, model: res.model, shapeHash: req.shapeHash, ttlMin: u.write1h || !u.write ? 60 : 5 };
+    answered.set(req.id, { prompt, ts: req.timestamp, model: res.model, shapeHash: req.shapeHash, ttlMin: u.write1h || !u.write ? 60 : 5 });
+    lastOf.set(hashes[0], answered.get(req.id));
   }
 }
 
@@ -313,6 +338,9 @@ if (topResult) findings.push({ effect: topResult.share, upperBound: true, what: 
 findings.sort((a, b) => b.effect - a.effect);
 
 const cpt = stats.charsPerToken.sort((a, b) => a - b);
+const q = (p) => cpt[Math.min(cpt.length - 1, Math.floor(p * cpt.length))];
+// Requests whose reconstructed prompt is far from the billed token count.
+const offRatio = cpt.filter((x) => x < 2 || x > 4.5).length / (cpt.length || 1);
 const summary = {
   contains: "Token totals, counts, timestamps and model names only. No prompts, code, file paths or tool output. "
     + (redact ? "MCP server names, MCP tool names and prompt section headings are replaced with placeholders." : "Includes MCP server names, tool names and prompt section headings; rerun with --redact to replace them."),
@@ -321,7 +349,8 @@ const summary = {
   prices: PRICES, assumedPricing: Object.fromEntries(assumedPricing),
   files: stats.files, requests: stats.requests, requestsWithoutResponse: stats.noResponse, unattributedMessages: stats.unattributed, missingBlobs: stats.missingBlobs,
   from: stats.first, to: stats.last, models: Object.fromEntries(stats.models),
-  charsPerToken: { min: cpt[0], median: cpt[cpt.length >> 1], max: cpt[cpt.length - 1] },
+  charsPerToken: { min: cpt[0], p5: q(0.05), median: q(0.5), p95: q(0.95), max: cpt[cpt.length - 1], shareOutside2to4_5: offRatio },
+  claudeCodeVersions: Object.fromEntries(stats.versions), querySources: Object.fromEntries(stats.sources),
   totalWeighted: total, categories: rows, cacheRebuilds: rebuilds, findings,
 };
 
@@ -353,5 +382,6 @@ if (asJson) {
   for (const f of findings.filter((f) => f.effect >= 0.005)) {
     console.log(`  ${f.upperBound ? "up to" : "     "} ${pct(f.effect)}  ${f.what}\n                 Fix: ${f.fix}`);
   }
-  console.log(`\nSanity: chars per token min ${cpt[0]?.toFixed(2)}, median ${cpt[cpt.length >> 1]?.toFixed(2)}, max ${cpt[cpt.length - 1]?.toFixed(2)}; ${stats.noResponse} requests had no logged response; ${stats.missingBlobs} missing blobs`);
+  console.log(`\nSanity: chars per token p5 ${q(0.05)?.toFixed(2)}, median ${q(0.5)?.toFixed(2)}, p95 ${q(0.95)?.toFixed(2)}; ${(offRatio * 100).toFixed(1)}% of requests outside 2 to 4.5; ${stats.noResponse} requests had no logged response; ${stats.missingBlobs} missing blobs`);
+  console.log(`Claude Code versions (attributed / unattributed requests): ${[...stats.versions].map(([v, c]) => `${v} ${c.attributed}/${c.unattributed}`).join(", ")}`);
 }
