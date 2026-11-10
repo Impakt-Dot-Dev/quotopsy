@@ -50,6 +50,16 @@ const args = process.argv.slice(2);
 const asJson = args.includes("--json");
 const redact = args.includes("--redact");
 const debugOn = args.includes("--debug");
+
+// Terminal styling. Progress and banner go to stderr so piped or redirected
+// output stays clean; colour is used only on a terminal that wants it.
+const noColor = globalThis.Deno ? globalThis.Deno.noColor : "NO_COLOR" in process.env;
+const paint = (stream) => (code, text) => (stream.isTTY && !noColor ? `\x1b[${code}m${text}\x1b[0m` : text);
+const out = paint(process.stdout), err = paint(process.stderr);
+const BOLD = 1, DIM = 2, CYAN = 36, YELLOW = 33, GREEN = 32;
+const BANNER = ["┌─┐ ┬ ┬┌─┐┌┬┐┌─┐┌─┐┌─┐┬ ┬", "│─┼┐│ ││ │ │ │ │├─┘└─┐└┬┘", "└─┘└└─┘└─┘ ┴ └─┘┴  └─┘ ┴ "];
+const bar = (share, width = 20) => "█".repeat(Math.round(share * width)).padEnd(width, "░");
+const num = (n) => Math.round(n).toLocaleString("en-US");
 const root = args.find((a) => !a.startsWith("--")) ?? join(homedir(), ".claude", "projects");
 
 function findJsonl(dir) {
@@ -216,7 +226,26 @@ function blockTypes(msg, into) {
   }
 }
 
-for (const file of findJsonl(root)) {
+let files;
+try { files = findJsonl(root); } catch { files = []; }
+if (!files.length) {
+  console.error(`No Claude Code session logs found in ${root}\nPass the folder that holds them: node prototype.mjs <logs-dir>`);
+  process.exit(1);
+}
+
+const started = Date.now();
+if (process.stderr.isTTY) {
+  process.stderr.write(`\n${BANNER.map((l) => "  " + err(CYAN, l)).join("\n")}\n  ${err(DIM, "where did your Claude Code usage go?")}\n\n`);
+}
+let lastDraw = 0;
+function progress(done) {
+  if (!process.stderr.isTTY || (Date.now() - lastDraw < 60 && done < files.length)) return;
+  lastDraw = Date.now();
+  process.stderr.write(`\r  Reading sessions  ${err(CYAN, bar(done / files.length, 24))}  ${done}/${files.length}`);
+}
+
+for (const file of files) {
+  progress(stats.files);
   stats.files++;
   const s = parseSession(file);
   for (const name of s.toolNames.values()) { count(calls, toolLabel(name)); count(calls, toolGroup(name)); }
@@ -333,6 +362,10 @@ for (const file of findJsonl(root)) {
   }
 }
 
+if (process.stderr.isTTY) {
+  process.stderr.write(`\r\x1b[2K  ${err(GREEN, "✓")} Read ${num(stats.files)} sessions and ${num(stats.requests + stats.unattributed)} requests in ${((Date.now() - started) / 1000).toFixed(1)}s, on this machine only\n\n`);
+}
+
 const total = [...cats.values()].reduce((n, c) => n + c.weighted, 0);
 const rows = [...cats.entries()].map(([name, c]) => ({
   name, read: c.read, write: c.write, fresh: c.fresh, output: c.output, weighted: c.weighted, share: c.weighted / total, calls: calls.get(name) ?? null,
@@ -367,7 +400,7 @@ for (const r of rows.filter((r) => r.name.startsWith(MCP))) {
 for (const sub of row("injected system messages")?.subs ?? []) {
   const server = sub.name.replace("MCP instructions: ", "");
   if (server === sub.name || row(MCP + server)) continue;
-  findings.push({ effect: sub.share, what: `${server}: instructions injected in every session, usage not measurable`, fix: "Disconnect it if you do not use it." });
+  findings.push({ effect: sub.share, what: `${server}: instructions loaded in every session; whether you use it cannot be measured`, fix: "Disconnect it if you do not use it." });
 }
 const thinking = row("output")?.subs.find((x) => x.name === "thinking");
 if (thinking) findings.push({ effect: thinking.share, upperBound: true, what: "Thinking tokens", fix: "Lower the effort level for routine work. Upper bound: the saving depends on how much less it thinks." });
@@ -401,32 +434,68 @@ if (debugOn) {
 
 if (asJson) {
   console.log(JSON.stringify(summary, null, 2));
+  if (process.stderr.isTTY && !process.stdout.isTTY) process.stderr.write(`  Summary written${redact ? ", with names replaced by placeholders" : ""}. Have a look before you share it.\n\n`);
+} else if (!total) {
+  console.log("  The logs contain no usage records yet.");
 } else {
-  const k = (n) => (n / 1000).toFixed(1).padStart(8) + "k";
-  const usd = (n) => ("$" + n.toFixed(2)).padStart(9);
-  const pct = (x) => (x * 100).toFixed(1).padStart(5) + "%";
-  console.log(`Quotopsy prototype: ${stats.files} sessions, ${stats.requests} requests, ${stats.first?.slice(0, 10)} to ${stats.last?.slice(0, 10)}`);
-  if (redact) console.log(`Redacted: MCP server names, MCP tool names and prompt section headings are placeholders`);
-  console.log(`Weighted at published API prices per model (hypothesis: limits may weight usage differently)`);
-  for (const [model, as] of assumedPricing) console.log(`No published price known for ${model}; priced as ${as}`);
+  const pct = (x) => (x * 100).toFixed(1) + "%";
+  const usd = (n) => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const title = (t) => t[0].toUpperCase() + t.slice(1);
+  const WIDTH = 72;
+  // Word-wrap to the report width, with a first-line prefix and a hanging indent.
+  const wrap = (text, first, hang, style = (t) => t) => {
+    let line = first;
+    for (const word of text.split(" ")) {
+      if (line.length + word.length + 1 > WIDTH + 2 && line.trim()) { console.log(style(line)); line = hang + word; }
+      else line += (line === first || line === hang ? "" : " ") + word;
+    }
+    console.log(style(line));
+  };
+  const heading = (left, right = "") => {
+    console.log(`  ${out(BOLD, left)}${out(DIM, right.padStart(WIDTH - left.length))}`);
+    console.log("  " + out(DIM, "─".repeat(WIDTH)));
+  };
+
+  console.log(`  ${num(stats.files)} sessions · ${num(stats.requests)} requests · ${stats.first?.slice(0, 10)} to ${stats.last?.slice(0, 10)} · ${out(BOLD, usd(total))} at API prices`);
+  if (redact) console.log(out(DIM, "  Names of MCP servers, MCP tools and prompt sections are replaced with placeholders"));
   console.log();
-  console.log(`${"share".padStart(6)}  ${"API $".padStart(9)}  ${"read".padStart(9)}  ${"written".padStart(9)}  ${"fresh".padStart(9)}  ${"output".padStart(9)}  calls  category (estimated)`);
-  for (const r of rows) {
-    console.log(`${pct(r.share)}  ${usd(r.weighted)}  ${k(r.read)}  ${k(r.write)}  ${k(r.fresh)}  ${k(r.output)}  ${String(r.calls ?? "").padStart(5)}  ${r.name}`);
-  }
-  const raw = rows.reduce((n, r) => n + r.read + r.write + r.fresh + r.output, 0);
-  console.log(`\nTotal: ${usd(total).trim()} API-equivalent from ${k(raw).trim()} raw tokens`);
 
-  console.log(`\nInside the larger categories (share of total)`);
-  for (const r of rows.filter((r) => r.share >= 0.05 && r.subs.length > 1)) {
-    console.log(`  ${r.name}`);
-    for (const sub of r.subs.slice(0, 5)) console.log(`    ${pct(sub.share)}  ${sub.name}${sub.calls != null ? ` (${sub.calls} calls)` : ""}`);
-  }
+  heading("WHAT TO FIX", "estimated share of cost");
+  const shown = findings.filter((f) => f.effect >= 0.005);
+  if (!shown.length) console.log("  Nothing above 0.5% of cost. Your setup looks lean.");
+  shown.forEach((f, i) => {
+    const [what, detail] = f.what.split("; ");
+    const effect = (f.upperBound ? "up to " : "") + pct(f.effect);
+    const room = WIDTH - effect.length - 6;
+    const left = `${String(i + 1).padStart(2)}  ${what.length > room ? what.slice(0, room - 1) + "…" : what}`;
+    console.log(`  ${out(BOLD, left)}${out(YELLOW, effect.padStart(Math.max(1, WIDTH - left.length)))}`);
+    if (detail) wrap(title(detail), "      ", "      ", (t) => out(DIM, t));
+    wrap(f.fix, "      → ", "        ");
+  });
+  console.log();
 
-  console.log(`\nFindings (estimated effect, share of API-equivalent cost)`);
-  for (const f of findings.filter((f) => f.effect >= 0.005)) {
-    console.log(`  ${f.upperBound ? "up to" : "     "} ${pct(f.effect)}  ${f.what}\n                 Fix: ${f.fix}`);
+  heading("WHERE IT WENT", "share      API $");
+  // Keep the table short: fold small MCP servers into one row.
+  const small = rows.filter((r) => r.name.startsWith(MCP) && r.share < 0.005);
+  const table = rows.filter((r) => !small.includes(r));
+  if (small.length) table.push({ name: `${small.length} other MCP servers`, share: small.reduce((n, r) => n + r.share, 0), weighted: small.reduce((n, r) => n + r.weighted, 0), subs: [] });
+  for (const r of table) {
+    console.log(`  ${title(r.name).slice(0, 30).padEnd(30)}  ${out(CYAN, bar(r.share))}  ${pct(r.share).padStart(6)}  ${usd(r.weighted).padStart(10)}`);
+    if (r.share < 0.05 || r.subs.length < 2) continue;
+    for (const sub of r.subs.slice(0, 3)) {
+      console.log(out(DIM, `      ${pct(sub.share).padStart(6)}  ${sub.name}${sub.calls != null ? ` (${num(sub.calls)} calls)` : ""}`));
+    }
   }
-  console.log(`\nSanity: chars per token p5 ${q(0.05)?.toFixed(2)}, median ${q(0.5)?.toFixed(2)}, p95 ${q(0.95)?.toFixed(2)}; ${(offRatio * 100).toFixed(1)}% of requests outside 2 to 4.5; ${stats.noResponse} requests had no logged response; ${stats.missingBlobs} missing blobs`);
-  console.log(`Claude Code versions (attributed / unattributed requests): ${[...stats.versions].map(([v, c]) => `${v} ${c.attributed}/${c.unattributed}`).join(", ")}`);
+  console.log();
+
+  heading("HOW TO READ THIS");
+  const notes = [
+    "Every figure is an estimate. Usage is priced at published API rates per model; how weekly limits weight it is not published.",
+    ...[...assumedPricing].map(([model, as]) => `No published price known for ${model}; priced as ${as}.`),
+    `Check: ${q(0.5)?.toFixed(2)} characters per token (median), ${(offRatio * 100).toFixed(1)}% of requests reconstructed poorly, ${num(stats.unattributed)} requests without a request record.`,
+    `Claude Code versions: ${[...stats.versions].map(([v, c]) => `${v} (${num(c.attributed + c.unattributed)})`).join(", ")}.`,
+    "Nothing left this machine. For a shareable summary: node prototype.mjs --json --redact",
+  ];
+  for (const note of notes) wrap(note, "  · ", "    ", (t) => out(DIM, t));
+  console.log();
 }
