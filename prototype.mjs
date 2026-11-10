@@ -9,7 +9,9 @@
 // headings with numbered placeholders, for output that will be shared.
 //
 // Uses only node: builtins, so it also runs under
-//   deno run --allow-read=$HOME/.claude --deny-net prototype.mjs
+//   deno run --allow-read=$HOME/.claude --deny-net prototype.mjs $HOME/.claude/projects
+// (the path is explicit because looking up the home directory needs a
+// further Deno permission)
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";

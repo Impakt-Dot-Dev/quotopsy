@@ -28,8 +28,12 @@ node prototype.mjs
 To enforce "read these logs, no network" instead of trusting the code:
 
 ```bash
-deno run --allow-read=$HOME/.claude --deny-net prototype.mjs
+deno run --allow-read=$HOME/.claude --deny-net prototype.mjs $HOME/.claude/projects
 ```
+
+The logs path is passed explicitly so the script needs no permission beyond
+reading that folder. Under these flags Deno refuses any network call and any
+read outside `~/.claude`.
 
 ## Sharing a summary
 
