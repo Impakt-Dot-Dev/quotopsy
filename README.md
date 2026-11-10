@@ -46,11 +46,22 @@ The file holds token totals, counts, timestamps and model names. It holds no
 prompts, code, file paths or tool output. Its first field, `contains`, states
 this and whether names were redacted.
 
+## Tests
+
+```bash
+npm test
+```
+
+The tests build synthetic session logs and never read real ones. When a new
+kind of log turns up, add a case that reproduces its structure, not its
+content.
+
 ## Limits
 
 - Needs Claude Code 2.1.300 or newer for attribution. Older versions do not
   log the request records it relies on, so their usage shows as
-  "unattributed". Checked on logs from 2.1.300 through 2.1.322.
+  "unattributed"; cache rebuilds after idle gaps are still detected from
+  usage alone. Checked on logs from 2.1.300 through 2.1.322.
 - Usage is weighted at published API prices per model (as of 2026-10), so
   shares are shares of API-equivalent cost. How weekly limits weight token
   types and models is not published.
