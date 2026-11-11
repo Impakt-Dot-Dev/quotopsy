@@ -7,6 +7,10 @@ estimates which part of the context each token belongs to: tool schemas,
 system prompt, MCP server instructions, tool results, history, output. It then
 lists findings the totals do not show, such as cache rebuilds after idle gaps.
 
+The report has five parts: what to fix (ranked), where it went (by category),
+by tool (each tool or MCP server's schema, calls and results added up), by
+model, and by thread (the main conversation and each subagent).
+
 - Runs locally. No network calls, no LLM calls, no dependencies.
 - One readable file: [quotopsy.mjs](quotopsy.mjs).
 - Every attribution is an estimate and is labeled as one.

@@ -395,3 +395,57 @@ test("one unreadable session does not lose the others", () => {
   assert.equal(summary.filesFailed, 1);
   near(summary.totalWeighted, 100 * 4 * M, "total");
 });
+
+// A two-request conversation in which the model calls Bash once.
+function toolConversation() {
+  const bash = { name: "Bash", description: "b".repeat(300) };
+  const search = { name: "mcp__github__search", description: "s".repeat(500) };
+  const reply = [{ type: "text", text: "Running it." }, { type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "ls " + "x".repeat(200) } }];
+  const result = [{ type: "tool_result", tool_use_id: "toolu_1", content: "o".repeat(900) }];
+  const s = new Session().shape("shape", [bash, search], ["# Rules\nBe brief."]);
+  s.request("r1", { tail: [s.blob(text("list the files"))] }).assistant("r1", { write1h: 400, output: 100 }, { content: reply });
+  s.user(result);
+  s.request("r2", { base: "r1", keep: 1, tail: [hashMessage({ role: "assistant", content: reply }), hashMessage({ role: "user", content: result })], minute: 1 })
+    .assistant("r2", { read: 400, write1h: 500, output: 20 });
+  return { s, reply };
+}
+
+test("adds up what each tool cost: its schema, its calls and its results", () => {
+  const { s, reply } = toolConversation();
+  const summary = run([s]);
+  assert.equal(summary.missingBlobs, 0);
+  const bash = summary.byTool.find((t) => t.name === "Bash"), github = summary.byTool.find((t) => t.name === "github");
+  assert.deepEqual([bash.kind, bash.calls, bash.loadedIn], ["tool", 1, 2]);
+  assert.deepEqual([github.kind, github.calls, github.loadedIn], ["mcp server", 0, 2]);
+
+  // Each piece is the same money the category table shows, seen per tool.
+  near(bash.schema, category(summary, "built-in tools").weighted, "Bash schema");
+  near(github.schema, category(summary, "MCP server: github").weighted, "github schema");
+  near(bash.results, category(summary, "tool results").weighted, "Bash results");
+  assert.equal(github.calling + github.results, 0);
+
+  // Calling = writing the call (its share of the response's output, by size)
+  // plus re-reading it as history in the next request.
+  const [textChars, callChars] = reply.map((b) => JSON.stringify(b).length);
+  const written = 100 * 20 * M * callChars / (textChars + callChars);
+  const reread = category(summary, "assistant history").subs.find((x) => x.name === "tool_use").share * summary.totalWeighted;
+  assert.ok(reread > 0);
+  near(bash.calling, written + reread, "Bash calling");
+  near(bash.cost, bash.schema + bash.calling + bash.results, "Bash total");
+  near(bash.share, bash.cost / summary.totalWeighted, "Bash share");
+  assertFinite(summary);
+});
+
+test("thinking is not charged to the tool the response went on to call", () => {
+  const { s } = toolConversation();
+  const plain = run([s]).byTool.find((t) => t.name === "Bash").calling;
+  // Same conversation, but the first response also spent 60 of its output tokens thinking.
+  const thoughtful = toolConversation().s;
+  thoughtful.lines = thoughtful.lines.map((l) => l.replace('"output_tokens":100,"output_tokens_details":{"thinking_tokens":0}', '"output_tokens":160,"output_tokens_details":{"thinking_tokens":60}'));
+  near(run([thoughtful]).byTool.find((t) => t.name === "Bash").calling, plain, "calling cost with thinking");
+});
+
+test("redaction replaces MCP server names in the per-tool table, not built-in tools", () => {
+  const names = run([toolConversation().s], { redact: true }).byTool.map((t) => t.name).sort();
+  assert.deepEqual(names, ["Bash", "server 1"]);
+});

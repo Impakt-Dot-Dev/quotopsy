@@ -116,6 +116,11 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
   function toolGroup(name) {
     return isMcp(name) ? MCP + alias("server", name.split("__")[1]) : "built-in tools";
   }
+  // The row a tool's costs add up under: its own for a built-in tool, its
+  // server's for an MCP tool.
+  function culpritOf(name) {
+    return isMcp(name) ? toolGroup(name) : name;
+  }
   // Built-in tool names are public; MCP tool names can describe private systems.
   function toolLabel(name) {
     return isMcp(name) ? alias("mcp tool", name) : name;
@@ -146,14 +151,18 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     return out;
   }
 
-  // One logged message -> [category, sub, chars] segments, in prompt order.
+  // One logged message -> [category, sub, chars, culprit] segments, in prompt
+  // order. `culprit` is [tool or server, which of its costs], when there is one.
   function blobSegments(msg, toolNames) {
     const blocks = typeof msg.content === "string" ? [{ type: "text", text: msg.content }] : (Array.isArray(msg.content) ? msg.content : []).filter((b) => b && typeof b === "object");
     return blocks.flatMap((b) => {
       const chars = blockChars(b);
       if (msg.role === "system") return sections(b.text ?? "").map(([s, c]) => ["injected system messages", s, c]);
-      if (msg.role === "assistant") return [["assistant history", b.type, chars]];
-      if (b.type === "tool_result") return [["tool results", toolLabel(toolNames.get(b.tool_use_id) ?? "(unknown tool)"), chars]];
+      if (msg.role === "assistant") return [["assistant history", b.type, chars, b.type === "tool_use" ? [culpritOf(String(b.name ?? "unknown")), "calling"] : null]];
+      if (b.type === "tool_result") {
+        const name = toolNames.get(b.tool_use_id) ?? "(unknown tool)";
+        return [["tool results", toolLabel(name), chars, [culpritOf(name), "results"]]];
+      }
       return [["user messages", (b.text ?? "").startsWith("<system-reminder>") ? "injected reminders" : "typed or pasted", chars]];
     });
   }
@@ -215,7 +224,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     // A response whose request was not logged is usage without a known cause.
     const logged = new Set(requests.map((r) => r.id));
     for (const [ref, res] of responses) if (!logged.has(ref)) { orphans.set(`ref ${ref}`, res); responses.delete(ref); }
-    return { blobs, shapes, requests, responses, orphans, toolNames, recordTypes };
+    return { blobs, shapes, requests, responses, orphans, toolNames, turns, recordTypes };
   }
 
   const cats = new Map(); // category -> { read, write, fresh, output, weighted, subs }
@@ -253,6 +262,20 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
   const calls = new Map(); // tool group or tool name -> call count
   const loadedIn = new Map(); // tool group -> requests that carried its schemas
   const rebuilds = [];
+  // Per tool or MCP server: what its schema, writing and re-reading its calls,
+  // and keeping its results in context cost. ESTIMATES, like every attribution.
+  const culprits = new Map();
+  const blame = ([who, field], weighted) => {
+    const c = culprits.get(who) ?? { schema: 0, calling: 0, results: 0 };
+    c[field] += weighted; culprits.set(who, c);
+  };
+  // Output spent writing tool calls: the response's non-thinking output, split
+  // across its text and tool-call blocks by size.
+  const blameOutput = (blocks = [], cost) => {
+    const sized = blocks.filter((b) => b.type !== "thinking" && b.type !== "redacted_thinking").map((b) => [b, blockChars(b)]);
+    const all = sized.reduce((n, [, c]) => n + c, 0);
+    for (const [b, c] of sized) if (b.type === "tool_use" && all) blame([culpritOf(String(b.name ?? "unknown")), "calling"], cost * c / all);
+  };
 
   // Structure-only diagnostics for --debug. Sizes, counts and type names; the
   // only names are tool and section labels, which --redact replaces.
@@ -304,6 +327,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       bump(cat, "fresh input", "fresh", u.fresh, u.fresh * w.fresh);
       bump("output", "thinking", "output", u.thinking, u.thinking * w.output);
       bump("output", "text and tool calls", "output", u.output - u.thinking, (u.output - u.thinking) * w.output);
+      blameOutput(s.turns.get(id), (u.output - u.thinking) * w.output);
       const writeCost = u.write5m * w.write5m + u.write1h * w.write1h;
       spend(byModel, modelName(model), u.fresh * w.fresh + writeCost + u.read * w.read, u.output * w.output);
       spend(byThread, sidechain ? "subagent: (type not logged)" : "main thread", u.fresh * w.fresh + writeCost + u.read * w.read, u.output * w.output);
@@ -344,6 +368,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       const u = splitUsage(res.usage), w = rates(res.model, res.usage);
       bump("output", "thinking", "output", u.thinking, u.thinking * w.output);
       bump("output", "text and tool calls", "output", u.output - u.thinking, (u.output - u.thinking) * w.output);
+      blameOutput(s.turns.get(res.id), (u.output - u.thinking) * w.output);
       const inputCost = u.fresh * w.fresh + u.write5m * w.write5m + u.write1h * w.write1h + u.read * w.read;
       spend(byModel, modelName(res.model), inputCost, u.output * w.output);
       spend(byThread, threadOf(req.querySource), inputCost, u.output * w.output);
@@ -353,8 +378,9 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       const tools = (Array.isArray(shape.tools) ? shape.tools : []).filter((t) => t && typeof t === "object").map((t) => [String(t.name ?? "unknown"), t]);
       const system = typeof shape.system === "string" ? [{ text: shape.system }] : Array.isArray(shape.system) ? shape.system : [];
       for (const g of new Set(tools.map(([name]) => toolGroup(name)))) count(loadedIn, g);
+      for (const [name] of tools) if (!isMcp(name)) count(loadedIn, name);
       const segs = [
-        ...tools.map(([name, t]) => [toolGroup(name), toolLabel(name), JSON.stringify(t).length]),
+        ...tools.map(([name, t]) => [toolGroup(name), toolLabel(name), JSON.stringify(t).length, [culpritOf(name), "schema"]]),
         ...system.flatMap((b) => sections(String(b?.text ?? "")).map(([sec, c]) => ["system prompt", sec, c])),
       ];
       // A message that cannot be found leaves a hole of unknown size.
@@ -405,12 +431,13 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       const writeRate = u.write ? (u.write5m * w.write5m + u.write1h * w.write1h) / u.write : 0;
       const bands = [["read", u.read, w.read], ["write", u.write, writeRate], ["fresh", u.fresh, w.fresh]];
       let pos = 0;
-      for (const [cat, sub, c] of segs) {
+      for (const [cat, sub, c, culprit] of segs) {
         const end = pos + c * perChar;
         let lo = 0;
         for (const [kind, size, rate] of bands) {
           const overlap = Math.max(0, Math.min(end, lo + size) - Math.max(pos, lo));
           if (overlap) bump(cat, sub, kind, overlap, overlap * rate);
+          if (overlap && culprit) blame(culprit, overlap * rate);
           lo += size;
         }
         pos = end;
@@ -492,6 +519,13 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
   const ranked = (map) => [...map.entries()]
     .map(([name, e]) => ({ name, requests: e.requests, cost: e.cost, share: share(e.cost), costPerRequest: e.cost / e.requests, outputShare: e.cost ? e.output / e.cost : 0 }))
     .sort((a, b) => b.cost - a.cost);
+  const byTool = [...culprits.entries()].map(([who, c]) => {
+    const cost = c.schema + c.calling + c.results;
+    return {
+      name: who.startsWith(MCP) ? who.slice(MCP.length) : who, kind: who.startsWith(MCP) ? "mcp server" : "tool",
+      calls: calls.get(who) ?? 0, loadedIn: loadedIn.get(who) ?? 0, schema: c.schema, calling: c.calling, results: c.results, cost, share: share(cost),
+    };
+  }).sort((a, b) => b.cost - a.cost);
   const cpt = stats.charsPerToken.sort((a, b) => a - b);
   const q = (p) => cpt[Math.min(cpt.length - 1, Math.floor(p * cpt.length))];
   // Requests whose reconstructed prompt is far from the billed token count.
@@ -508,7 +542,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     charsPerToken: { min: cpt[0], p5: q(0.05), median: q(0.5), p95: q(0.95), max: cpt[cpt.length - 1], shareOutside2to4_5: offRatio },
     claudeCodeVersions: Object.fromEntries(stats.versions), querySources: Object.fromEntries(stats.sources),
     totalWeighted: total, categories: rows, cacheRebuilds: rebuilds, findings,
-    byModel: ranked(byModel), byThread: ranked(byThread),
+    byModel: ranked(byModel), byThread: ranked(byThread), byTool,
     injectedByType: Object.fromEntries([...attachments].sort((a, b) => b[1].chars - a[1].chars)),
   };
   if (debugOn) {
@@ -583,6 +617,19 @@ function printReport(summary, redact) {
   }
   console.log();
 
+  // One row per tool or MCP server: everything it cost, wherever it shows up
+  // in the table above.
+  if (summary.byTool.length) {
+    heading("BY TOOL", "calls   schema  calling  results    share      API $");
+    const shown = summary.byTool.filter((r) => r.share >= 0.001).slice(0, 8);
+    for (const r of shown) {
+      const name = r.kind === "mcp server" ? `${r.name} (MCP)` : r.name;
+      console.log(`  ${(name.length > 20 ? name.slice(0, 19) + "…" : name).padEnd(20)}${num(r.calls).padStart(7)}${usd(r.schema).padStart(9)}${usd(r.calling).padStart(9)}${usd(r.results).padStart(9)}${pct(r.share).padStart(9)}${usd(r.cost).padStart(11)}`);
+    }
+    if (summary.byTool.length > shown.length) console.log(out(DIM, `  and ${summary.byTool.length - shown.length} smaller ones`));
+    console.log();
+  }
+
   // Who spent it: shown only when there is more than one to compare.
   for (const [name, list] of [["BY MODEL", summary.byModel], ["BY THREAD", summary.byThread]]) {
     if (list.length < 2) continue;
@@ -597,6 +644,7 @@ function printReport(summary, redact) {
   heading("HOW TO READ THIS");
   const notes = [
     "Every figure is an estimate. Usage is priced at published API rates per model; how weekly limits weight it is not published.",
+    "By tool: schema is its definition loaded in every request; calling is writing its calls and re-reading them later; results is its output kept in context.",
     ...Object.entries(summary.assumedPricing).map(([model, as]) => `No published price known for ${model}; priced as ${as}.`),
     `Check: ${summary.charsPerToken.median?.toFixed(2)} characters per token (median), ${(summary.charsPerToken.shareOutside2to4_5 * 100).toFixed(1)}% of requests reconstructed poorly, ${num(summary.unattributedMessages)} requests without a request record.`,
     `Claude Code versions: ${Object.entries(summary.claudeCodeVersions).map(([v, c]) => `${v} (${num(c.attributed + c.unattributed)})`).join(", ")}.`,
