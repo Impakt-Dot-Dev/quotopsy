@@ -562,7 +562,7 @@ const paint = (stream) => (code, text) => (stream.isTTY && !noColor ? `\x1b[${co
 const out = paint(process.stdout), err = paint(process.stderr);
 // Same accents as quotopsy.com: green for the brand and bars, amber for costs.
 const BOLD = 1, DIM = 2, YELLOW = 33, GREEN = 32;
-const BANNER = ["┌─┐ ┬ ┬┌─┐┌┬┐┌─┐┌─┐┌─┐┬ ┬", "│─┼┐│ ││ │ │ │ │├─┘└─┐└┬┘", "└─┘└└─┘└─┘ ┴ └─┘┴  └─┘ ┴ "];
+const BANNER = ["▀▄  █▀█  █ █ █▀█ ▀█▀ █▀█ █▀█ █▀ █▄█", "▄▀  █▄█▄ █▄█ █▄█  █  █▄█ █▀▀ ▄█  █ "];
 const bar = (share, width = 20) => "█".repeat(Math.round(share * width)).padEnd(width, "░");
 const num = (n) => Math.round(n).toLocaleString("en-US");
 
