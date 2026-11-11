@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { analyze, hashMessage } from "../quotopsy.mjs";
+import { analyze, hashMessage, parseDay } from "../quotopsy.mjs";
 
 const OPUS = "claude-opus-5-5"; // $4 in, $0.20 cache read, $8 one-hour write, $20 out, per million tokens
 const M = 1e-6;
@@ -474,4 +474,63 @@ test("the report shows dates in the reader's time zone, not UTC", () => {
   assert.match(report(session, "UTC"), /2026-11-01 to 2026-11-02/);
   // Kiritimati, 14 hours ahead, is already on the 2nd at 10:00 UTC on the 1st.
   assert.match(report(session, "Pacific/Kiritimati"), /2026-11-02 to 2026-11-02/);
+});
+
+test("a period keeps only the usage inside it, and the two sides add up to the whole", () => {
+  const sessions = () => [conversation({ minute: 5, usage: { read: 20000, write1h: 6000, output: 300 } }, { minute: 3000, usage: { read: 26000, write1h: 4000, output: 500 } })];
+  const cut = T0 + 1000 * 60000;
+  const whole = run(sessions()), before = run(sessions(), { until: cut }), after = run(sessions(), { since: cut });
+  assert.equal(before.requests, 2);
+  assert.equal(after.requests, 1);
+  near(after.totalWeighted, (26000 * 0.2 + 4000 * 8 + 500 * 20) * M, "only the third request");
+  near(before.totalWeighted + after.totalWeighted, whole.totalWeighted, "before plus after");
+  assert.equal(after.from, at(3000));
+  assert.equal(after.since, new Date(cut).toISOString());
+  assert.equal(whole.since, null);
+  assertFinite(after);
+});
+
+test("a rebuild at the start of a period is still found from the request before it", () => {
+  const sessions = [conversation({ minute: 5, usage: { read: 20000, write1h: 6000 } }, { minute: 3000, usage: { read: 1000, write1h: 30000 } })];
+  const after = run(sessions, { since: T0 + 1000 * 60000 });
+  assert.equal(after.cacheRebuilds.length, 1);
+  assert.equal(after.cacheRebuilds[0].cause, "idle longer than the cache lifetime");
+  assert.equal(after.cacheRebuilds[0].tokens, 25000); // the 26,000-token prompt before the cut, minus the 1,000 read back
+});
+
+test("a period counts only the sessions and tool calls inside it", () => {
+  const early = new Session().assistant(null, { fresh: 1000 }, { minute: 0, content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] });
+  const late = new Session();
+  late.n = 10; // message ids differ from the first session's, or it would count as a repeat
+  late.assistant(null, { fresh: 1000 }, { minute: 3000, content: [{ type: "tool_use", id: "t2", name: "Bash", input: {} }] });
+  const after = run([early, late], { since: T0 + 1000 * 60000 });
+  assert.equal(after.files, 1);
+  assert.equal(after.filesScanned, 2);
+  assert.equal(after.unattributedMessages, 1);
+  assert.equal(after.byTool.find((t) => t.name === "Bash").calls, 1);
+});
+
+test("reads --since and --until days in the local time zone", () => {
+  const now = new Date(2026, 10, 11, 15, 30);
+  assert.equal(parseDay("2026-11-04"), new Date(2026, 10, 4).getTime());
+  assert.equal(parseDay("2026-11-04", 1), new Date(2026, 10, 5).getTime()); // --until includes its day
+  assert.equal(parseDay("7d", 0, now), new Date(2026, 10, 4).getTime());
+  assert.equal(parseDay("0d", 0, now), new Date(2026, 10, 11).getTime());
+  for (const bad of ["yesterday", "2026-02-31", "2026-13-01", "11/04/2026", ""]) assert.equal(parseDay(bad), null, bad);
+});
+
+test("the command line applies --since, in either spelling, and rejects a bad day", () => {
+  const cli = fileURLToPath(new URL("../quotopsy.mjs", import.meta.url));
+  const root = logsFolder([new Session().assistant(null, { fresh: 1000, output: 100 }, { minute: 0 }).assistant(null, { fresh: 1000, output: 100 }, { minute: 3000 })]);
+  const cliRun = (...args) => spawnSync(process.execPath, [cli, root, ...args], { encoding: "utf8", env: { ...process.env, TZ: "UTC", NO_COLOR: "1" } });
+  assert.equal(JSON.parse(cliRun("--json").stdout).unattributedMessages, 2);
+  assert.equal(JSON.parse(cliRun("--json", "--since=2026-11-02").stdout).unattributedMessages, 1);
+  assert.equal(JSON.parse(cliRun("--since", "2026-11-02", "--json").stdout).unattributedMessages, 1);
+  assert.equal(JSON.parse(cliRun("--json", "--until=2026-11-01").stdout).unattributedMessages, 1);
+  assert.match(cliRun("--since=2026-11-02").stdout, /Only usage from 2026-11-02/);
+  assert.match(cliRun("--since=2026-11-01", "--until=2026-11-02").stdout, /Only usage from 2026-11-01 up to 2026-11-02/);
+  assert.match(cliRun("--since=2027-01-01").stdout, /No usage in that period/);
+  const bad = cliRun("--since=soon");
+  assert.equal(bad.status, 1);
+  assert.match(bad.stderr, /needs a day/);
 });

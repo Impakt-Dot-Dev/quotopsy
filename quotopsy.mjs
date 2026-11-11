@@ -79,7 +79,16 @@ function splitUsage(u) {
 
 // Analyse every session log under `root` and return the summary object.
 // `onProgress(done, total)` is called before each file is read.
-export function analyze(root, { redact = false, debug: debugOn = false, onProgress = () => {} } = {}) {
+// `since` and `until` (milliseconds) limit the summary to usage from `since`
+// up to, not including, `until`. Earlier requests are still read, because
+// later ones are logged as changes to them.
+export function analyze(root, { redact = false, debug: debugOn = false, onProgress = () => {}, since = null, until = null } = {}) {
+  const filtered = since !== null || until !== null;
+  const inRange = (ts) => {
+    if (!filtered) return true;
+    const t = Date.parse(ts);
+    return (since === null || t >= since) && (until === null || t < until);
+  };
   const assumedPricing = new Map(); // model -> model whose prices were used
   const modelName = (model) => MODEL_ID.exec(model ?? "")?.[0] ?? (model ? alias("model", String(model)) : "unknown");
   function rates(model, usage = {}) {
@@ -171,6 +180,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     const blobs = new Map(), shapes = new Map(), requests = [], responses = new Map();
     const orphans = new Map(); // assistant messages with no logged request
     const toolNames = new Map(); // tool_use id -> tool name
+    const toolTimes = new Map(); // tool_use id -> when it was called
     const turns = new Map(); // assistant message id -> merged content blocks
     const transcript = []; // messages only logged as transcript records
     let run = []; // user records since the last assistant record
@@ -187,10 +197,12 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       else if (o.type === "attachment") {
         // Context Claude Code injects by itself: skill and agent listings,
         // MCP instructions, memory and instruction files. Sizes only.
-        const a = attachments.get(o.attachment?.type ?? "unknown") ?? { count: 0, chars: 0 };
-        a.count++;
-        for (const r of Array.isArray(o.rendered) ? o.rendered : []) a.chars += typeof r?.content === "string" ? r.content.length : 0;
-        attachments.set(o.attachment?.type ?? "unknown", a);
+        if (inRange(o.timestamp)) {
+          const a = attachments.get(o.attachment?.type ?? "unknown") ?? { count: 0, chars: 0 };
+          a.count++;
+          for (const r of Array.isArray(o.rendered) ? o.rendered : []) a.chars += typeof r?.content === "string" ? r.content.length : 0;
+          attachments.set(o.attachment?.type ?? "unknown", a);
+        }
         if (o.attachment?.type === "mcp_instructions_delta" && Array.isArray(o.attachment.addedNames)) for (const n of o.attachment.addedNames) mcpServers.add(String(n).trim());
       }
       else if (o.type === "assistant" && o.message?.usage) {
@@ -199,7 +211,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
         if (String(o.message.model ?? "").startsWith("<")) continue; // synthetic local message, not an API call
         const content = (Array.isArray(o.message.content) ? o.message.content : []).filter((b) => b && typeof b === "object");
         (key ? responses : orphans).set(key ?? o.message.id, { id: o.message.id, usage: o.message.usage, model: o.message.model, version: o.version, sidechain: !!o.isSidechain, ts: o.timestamp, thread: o.isSidechain ? `agent ${o.agentId ?? ""}` : "main" });
-        for (const b of content) if (b.type === "tool_use") toolNames.set(b.id, String(b.name ?? "unknown"));
+        for (const b of content) if (b.type === "tool_use") { toolNames.set(b.id, String(b.name ?? "unknown")); toolTimes.set(b.id, o.timestamp); }
         turns.set(o.message.id, [...(turns.get(o.message.id) ?? []), ...content]);
         run = [];
       } else if (o.type === "user" && o.message?.content) {
@@ -224,7 +236,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     // A response whose request was not logged is usage without a known cause.
     const logged = new Set(requests.map((r) => r.id));
     for (const [ref, res] of responses) if (!logged.has(ref)) { orphans.set(`ref ${ref}`, res); responses.delete(ref); }
-    return { blobs, shapes, requests, responses, orphans, toolNames, turns, recordTypes };
+    return { blobs, shapes, requests, responses, orphans, toolNames, toolTimes, turns, recordTypes };
   }
 
   const cats = new Map(); // category -> { read, write, fresh, output, weighted, subs }
@@ -298,16 +310,18 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
   const clean = { chars: 0, tokens: 0 };
   const UNRESOLVED = "unresolved messages";
 
-  for (const file of files) {
-    onProgress(stats.files, files.length);
-    stats.files++;
+  for (const [i, file] of files.entries()) {
+    onProgress(i, files.length);
     // One unreadable session should not lose the rest.
-    try { readSession(file); } catch { stats.failedFiles++; }
+    try { if (readSession(file)) stats.files++; } catch { stats.failedFiles++; if (!filtered) stats.files++; }
   }
 
+  // Returns whether the session counts: always, unless a period was asked for
+  // and the session has no usage in it.
   function readSession(file) {
     const s = parseSession(file);
-    for (const name of s.toolNames.values()) { count(calls, toolLabel(name)); count(calls, toolGroup(name)); }
+    let active = !filtered;
+    for (const [id, name] of s.toolNames) if (inRange(s.toolTimes.get(id))) { count(calls, toolLabel(name)); count(calls, toolGroup(name)); }
 
     // Sessions without request records: usage is known, its cause is not.
     for (const [type, n] of s.recordTypes) debug.recordTypes.set(type, (debug.recordTypes.get(type) ?? 0) + n);
@@ -315,6 +329,13 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     for (const { id, usage, model, version, sidechain, ts, thread } of s.orphans.values()) {
       if (id && counted.has(id)) continue;
       counted.add(id);
+      if (!inRange(ts)) {
+        // Outside the period: remember it only as what the next one follows.
+        const u = splitUsage(usage);
+        lastOrphan.set(thread, { prompt: u.fresh + u.write + u.read, ts, ttlMin: u.write1h || !u.write ? 60 : 5 });
+        continue;
+      }
+      active = true;
       coverage(version, "unattributed");
       count(stats.models, modelName(model));
       seen(ts);
@@ -355,9 +376,17 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       const hashes = [...(baseList ?? []).slice(0, keep), ...tail];
       msgLists.set(req.id, hashes);
       const res = s.responses.get(req.id);
-      if (!res) { stats.noResponse++; continue; }
+      if (!res) { if (inRange(req.timestamp)) stats.noResponse++; continue; }
       if (counted.has(req.id)) continue;
       counted.add(req.id);
+      if (!inRange(req.timestamp)) {
+        // Outside the period: remember it only as what a later request extends.
+        const u = splitUsage(res.usage);
+        answered.set(req.id, { prompt: u.fresh + u.write + u.read, ts: req.timestamp, model: res.model, shapeHash: req.shapeHash, ttlMin: u.write1h || !u.write ? 60 : 5 });
+        lastOf.set(hashes[0], answered.get(req.id));
+        continue;
+      }
+      active = true;
       stats.requests++;
       count(stats.models, modelName(res.model));
       const source = redact ? threadOf(req.querySource) : req.querySource ?? "unknown";
@@ -471,6 +500,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       answered.set(req.id, { prompt, ts: req.timestamp, model: res.model, shapeHash: req.shapeHash, ttlMin: u.write1h || !u.write ? 60 : 5 });
       lastOf.set(hashes[0], answered.get(req.id));
     }
+    return active;
   }
 
   const total = [...cats.values()].reduce((n, c) => n + c.weighted, 0);
@@ -537,7 +567,8 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     redacted: redact,
     unit: "API-equivalent US dollars at published prices (hypothesis: limits may weight usage differently)",
     prices: PRICES, assumedPricing: Object.fromEntries(assumedPricing),
-    files: stats.files, filesFailed: stats.failedFiles, requests: stats.requests, requestsWithoutResponse: stats.noResponse, unattributedMessages: stats.unattributed, missingBlobs: stats.missingBlobs,
+    since: since === null ? null : new Date(since).toISOString(), until: until === null ? null : new Date(until).toISOString(),
+    files: stats.files, filesScanned: files.length, filesFailed: stats.failedFiles, requests: stats.requests, requestsWithoutResponse: stats.noResponse, unattributedMessages: stats.unattributed, missingBlobs: stats.missingBlobs,
     from: stats.first, to: stats.last, models: Object.fromEntries(stats.models),
     charsPerToken: { min: cpt[0], p5: q(0.05), median: q(0.5), p95: q(0.95), max: cpt[cpt.length - 1], shareOutside2to4_5: offRatio },
     claudeCodeVersions: Object.fromEntries(stats.versions), querySources: Object.fromEntries(stats.sources),
@@ -589,6 +620,11 @@ function printReport(summary, redact) {
   };
 
   console.log(`  ${num(summary.files)} sessions · ${num(summary.requests + summary.unattributedMessages)} requests · ${day(summary.from)} to ${day(summary.to)} · ${out(BOLD, usd(summary.totalWeighted))} at API prices`);
+  if (summary.since || summary.until) {
+    // `until` is the first moment left out, so step back to name its last day.
+    const period = [summary.since && `from ${day(summary.since)}`, summary.until && `up to ${day(new Date(Date.parse(summary.until) - 1).toISOString())}`].filter(Boolean).join(" ");
+    console.log(out(DIM, `  Only usage ${period}`));
+  }
   if (redact) console.log(out(DIM, "  Names of MCP servers, MCP tools and prompt sections are replaced with placeholders"));
   console.log();
 
@@ -658,9 +694,35 @@ function printReport(summary, redact) {
   console.log();
 }
 
+// A day given as YYYY-MM-DD, or as a number of days back from today ("7d"),
+// read in the local time zone. Returns the start of that day plus `addDays`.
+export function parseDay(text, addDays = 0, now = new Date()) {
+  const ago = /^(\d+)d$/.exec(text), ymd = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+  if (!ago && !ymd) return null;
+  const d = ago ? new Date(now.getFullYear(), now.getMonth(), now.getDate() - Number(ago[1])) : new Date(Number(ymd[1]), Number(ymd[2]) - 1, Number(ymd[3]));
+  // Reject dates the calendar rolled over, such as 2026-02-31.
+  if (ymd && (d.getMonth() !== Number(ymd[2]) - 1 || d.getDate() !== Number(ymd[3]))) return null;
+  d.setDate(d.getDate() + addDays);
+  return d.getTime();
+}
+
 function main() {
   const args = process.argv.slice(2);
   const asJson = args.includes("--json"), redact = args.includes("--redact"), debug = args.includes("--debug");
+  // --since=DAY and --until=DAY, also accepted as two words.
+  const period = {};
+  for (const name of ["since", "until"]) {
+    const i = args.findIndex((a) => a === `--${name}` || a.startsWith(`--${name}=`));
+    if (i < 0) continue;
+    const [arg, next] = args.splice(i, args[i].includes("=") ? 1 : 2);
+    const value = arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : next ?? "";
+    // --until names the last day to include, so the cut is the start of the next one.
+    period[name] = parseDay(value, name === "until" ? 1 : 0);
+    if (period[name] === null) {
+      console.error(`--${name} needs a day, as YYYY-MM-DD or a number of days back such as 7d. Got: ${value || "nothing"}`);
+      process.exit(1);
+    }
+  }
   const root = args.find((a) => !a.startsWith("--")) ?? join(homedir(), ".claude", "projects");
 
   const started = Date.now();
@@ -677,10 +739,10 @@ function main() {
   };
 
   let summary;
-  try { summary = analyze(root, { redact, debug, onProgress }); } catch (e) {
+  try { summary = analyze(root, { redact, debug, onProgress, ...period }); } catch (e) {
     if (e?.code !== "ENOENT" && e?.code !== "ENOTDIR") throw e;
   }
-  if (!summary?.files) {
+  if (!summary?.filesScanned) {
     console.error(`No Claude Code session logs found in ${root}\nPass the folder that holds them: npx quotopsy <logs-dir>`);
     process.exit(1);
   }
@@ -692,7 +754,7 @@ function main() {
     console.log(JSON.stringify(summary, null, 2));
     if (process.stderr.isTTY && !process.stdout.isTTY) process.stderr.write(`  Summary written${redact ? ", with names replaced by placeholders" : ""}. Have a look before you share it.\n\n`);
   } else if (!summary.totalWeighted) {
-    console.log("  The logs contain no usage records yet.");
+    console.log(summary.since || summary.until ? "  No usage in that period." : "  The logs contain no usage records yet.");
   } else {
     printReport(summary, redact);
   }

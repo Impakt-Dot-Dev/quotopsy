@@ -38,9 +38,20 @@ node quotopsy.mjs
 | Option | Effect |
 | --- | --- |
 | `[logs-dir]` | Logs to read. Defaults to `~/.claude/projects`. |
+| `--since=DAY` | Only usage from that day on. `DAY` is `YYYY-MM-DD`, or a number of days back such as `7d`. |
+| `--until=DAY` | Only usage up to the end of that day. |
 | `--json` | Print the summary as JSON instead of a report. |
 | `--redact` | Replace MCP server names, MCP tool names and prompt section headings with placeholders. |
 | `--debug` | With `--json`, add structure-only diagnostics for requests the tool handled badly: record types, block types, sizes and counts. No message text. |
+
+To see whether a change of setup or habits helped, compare two periods:
+
+```bash
+npx quotopsy --until=2026-11-10
+npx quotopsy --since=2026-11-11
+```
+
+Days are read in your local time zone.
 
 To enforce "read these logs, no network" instead of trusting the code:
 
