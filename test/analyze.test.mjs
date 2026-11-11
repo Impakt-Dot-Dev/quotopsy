@@ -534,3 +534,36 @@ test("the command line applies --since, in either spelling, and rejects a bad da
   assert.equal(bad.status, 1);
   assert.match(bad.stderr, /needs a day/);
 });
+
+// A request whose history holds one assistant message: a thinking block and a text reply.
+function thinkingHistory(thinkingBlock, usage) {
+  const reply = { type: "text", text: "reply ".repeat(100) };
+  const s = new Session().shape("shape", [], []);
+  s.request("r1", { tail: [s.blob(text("first")), s.blob({ role: "assistant", content: [thinkingBlock, reply] }), s.blob(text("second"))] })
+    .assistant("r1", usage);
+  const history = category(run([s]), "assistant history");
+  const share = (name) => history.subs.find((x) => x.name === name)?.share ?? 0;
+  return { ratio: share("thinking") / share("text"), replyChars: JSON.stringify(reply).length, summary: run([s]) };
+}
+
+test("thinking in the history is sized from its signature, not counted as text", () => {
+  // The first 1,000 characters of a signature count for nothing, the rest 1.4 times.
+  const signed = thinkingHistory({ type: "thinking", thinking: "", signature: "s".repeat(3000) }, { read: 10000 });
+  near(signed.ratio, 2000 * 1.4 / signed.replyChars, "signature");
+  // Thinking logged as text is counted by its text.
+  const plain = thinkingHistory({ type: "thinking", thinking: "t".repeat(500) }, { read: 10000 });
+  near(plain.ratio, 500 / plain.replyChars, "text");
+  // A signature shorter than the overhead adds nothing.
+  assert.equal(thinkingHistory({ type: "thinking", thinking: "", signature: "s".repeat(400) }, { read: 10000 }).ratio, 0);
+});
+
+test("the thinking finding adds what was written to what was re-read", () => {
+  const { summary } = thinkingHistory({ type: "thinking", thinking: "", signature: "s".repeat(3000) }, { read: 10000, output: 1000, thinking: 400 });
+  const finding = summary.findings.find((f) => f.what.startsWith("Thinking tokens"));
+  const written = category(summary, "output").subs.find((x) => x.name === "thinking").share;
+  const reread = category(summary, "assistant history").subs.find((x) => x.name === "thinking").share;
+  assert.ok(written > 0 && reread > 0);
+  near(finding.effect, written + reread, "both parts");
+  assert.match(finding.what, /written as output, .*re-read in later requests/);
+  assert.deepEqual(summary.thinkingSignatures, { responses: 0, chars: 0, thinkingTokens: 0 }); // the response itself logged no signature
+});

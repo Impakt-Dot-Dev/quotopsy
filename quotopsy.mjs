@@ -59,6 +59,19 @@ function blockChars(b) {
   return text.length + media * MEDIA_CHARS;
 }
 
+// Claude Code logs thinking as an encrypted signature, usually with no text,
+// and sends it back with every later request. Counting the signature as plain
+// text overstates what that costs. ESTIMATE, fitted on 537 real requests from
+// one machine: the billed prompt size is explained most consistently when the
+// first 1,000 characters of a signature count for nothing and the rest count
+// 1.4 times. `thinkingSignatures` in the summary lets other logs check this.
+const SIGNATURE_OVERHEAD = 1000, SIGNATURE_TO_TEXT = 1.4;
+function thinkingChars(b) {
+  const text = typeof b.thinking === "string" ? b.thinking.length : 0;
+  const signature = typeof b.signature === "string" ? b.signature.length : 0;
+  return Math.max(text, (signature - SIGNATURE_OVERHEAD) * SIGNATURE_TO_TEXT, 0);
+}
+
 // Blob hashes are SHA-256 of the message as compact JSON with sorted keys.
 const sorted = (v) => Array.isArray(v) ? v.map(sorted) : v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sorted(v[k])])) : v;
 export const hashMessage = (m) => createHash("sha256").update(JSON.stringify(sorted(m))).digest("hex");
@@ -165,7 +178,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
   function blobSegments(msg, toolNames) {
     const blocks = typeof msg.content === "string" ? [{ type: "text", text: msg.content }] : (Array.isArray(msg.content) ? msg.content : []).filter((b) => b && typeof b === "object");
     return blocks.flatMap((b) => {
-      const chars = blockChars(b);
+      const chars = b.type === "thinking" ? thinkingChars(b) : blockChars(b);
       if (msg.role === "system") return sections(b.text ?? "").map(([s, c]) => ["injected system messages", s, c]);
       if (msg.role === "assistant") return [["assistant history", b.type, chars, b.type === "tool_use" ? [culpritOf(String(b.name ?? "unknown")), "calling"] : null]];
       if (b.type === "tool_result") {
@@ -274,6 +287,13 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
   const calls = new Map(); // tool group or tool name -> call count
   const loadedIn = new Map(); // tool group -> requests that carried its schemas
   const rebuilds = [];
+  // Signature size against billed thinking tokens, to check the estimate above.
+  const signatures = { responses: 0, chars: 0, thinkingTokens: 0 };
+  const signatureCheck = (blocks = [], thinkingTokens) => {
+    const chars = blocks.reduce((n, b) => n + (b.type === "thinking" && typeof b.signature === "string" ? b.signature.length : 0), 0);
+    if (!chars || !thinkingTokens) return;
+    signatures.responses++; signatures.chars += chars; signatures.thinkingTokens += thinkingTokens;
+  };
   // Per tool or MCP server: what its schema, writing and re-reading its calls,
   // and keeping its results in context cost. ESTIMATES, like every attribution.
   const culprits = new Map();
@@ -349,6 +369,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       bump("output", "thinking", "output", u.thinking, u.thinking * w.output);
       bump("output", "text and tool calls", "output", u.output - u.thinking, (u.output - u.thinking) * w.output);
       blameOutput(s.turns.get(id), (u.output - u.thinking) * w.output);
+      signatureCheck(s.turns.get(id), u.thinking);
       const writeCost = u.write5m * w.write5m + u.write1h * w.write1h;
       spend(byModel, modelName(model), u.fresh * w.fresh + writeCost + u.read * w.read, u.output * w.output);
       spend(byThread, sidechain ? "subagent: (type not logged)" : "main thread", u.fresh * w.fresh + writeCost + u.read * w.read, u.output * w.output);
@@ -398,6 +419,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       bump("output", "thinking", "output", u.thinking, u.thinking * w.output);
       bump("output", "text and tool calls", "output", u.output - u.thinking, (u.output - u.thinking) * w.output);
       blameOutput(s.turns.get(res.id), (u.output - u.thinking) * w.output);
+      signatureCheck(s.turns.get(res.id), u.thinking);
       const inputCost = u.fresh * w.fresh + u.write5m * w.write5m + u.write1h * w.write1h + u.read * w.read;
       spend(byModel, modelName(res.model), inputCost, u.output * w.output);
       spend(byThread, threadOf(req.querySource), inputCost, u.output * w.output);
@@ -541,7 +563,10 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     findings.push({ effect: sub.share, what: `${server}: instructions loaded in every session; whether you use it cannot be measured`, fix: "Disconnect it if you do not use it." });
   }
   const thinking = row("output")?.subs.find((x) => x.name === "thinking");
-  if (thinking) findings.push({ effect: thinking.share, upperBound: true, what: "Thinking tokens", fix: "Lower the effort level for routine work. Upper bound: the saving depends on how much less it thinks." });
+  // Thinking is paid for twice: once written as output, then re-read as part
+  // of the history in every later request.
+  const reread = row("assistant history")?.subs.find((x) => x.name === "thinking")?.share ?? 0;
+  if (thinking) findings.push({ effect: thinking.share + reread, upperBound: true, what: `Thinking tokens; ${(thinking.share * 100).toFixed(1)}% written as output, ${(reread * 100).toFixed(1)}% re-read in later requests`, fix: "Lower the effort level for routine work. Upper bound: the saving depends on how much less it thinks." });
   const topResult = row("tool results")?.subs[0];
   if (topResult) findings.push({ effect: topResult.share, upperBound: true, what: `Results of ${topResult.name} (${topResult.calls ?? 0} calls) kept in context`, fix: "Ask for narrower output (line ranges, filters), or hand bulky reads to a subagent." });
   findings.sort((a, b) => b.effect - a.effect);
@@ -570,6 +595,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     since: since === null ? null : new Date(since).toISOString(), until: until === null ? null : new Date(until).toISOString(),
     files: stats.files, filesScanned: files.length, filesFailed: stats.failedFiles, requests: stats.requests, requestsWithoutResponse: stats.noResponse, unattributedMessages: stats.unattributed, missingBlobs: stats.missingBlobs,
     from: stats.first, to: stats.last, models: Object.fromEntries(stats.models),
+    thinkingSignatures: signatures,
     charsPerToken: { min: cpt[0], p5: q(0.05), median: q(0.5), p95: q(0.95), max: cpt[cpt.length - 1], shareOutside2to4_5: offRatio },
     claudeCodeVersions: Object.fromEntries(stats.versions), querySources: Object.fromEntries(stats.sources),
     totalWeighted: total, categories: rows, cacheRebuilds: rebuilds, findings,
@@ -689,6 +715,7 @@ function printReport(summary, redact) {
     `Claude Code versions: ${Object.entries(summary.claudeCodeVersions).map(([v, c]) => `${v} (${num(c.attributed + c.unattributed)})`).join(", ")}.`,
     ...(summary.filesFailed ? [`${num(summary.filesFailed)} session files could not be read and are left out.`] : []),
     "Nothing left this machine. For a shareable summary: npx quotopsy --json --redact",
+    "A lean setup kit is planned. Waitlist: https://quotopsy.com/#waitlist",
   ];
   for (const note of notes) wrap(note, "  · ", "    ", (t) => out(DIM, t));
   console.log();
