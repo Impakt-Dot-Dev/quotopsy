@@ -25,7 +25,7 @@ can fix it without seeing your logs. It contains no message text either.
 2. Run:
 
    ```bash
-   npx github:Impakt-Dot-Dev/quotopsy --json --redact --debug > summary.json
+   npx quotopsy --json --redact --debug > summary.json
    ```
 
 3. Run this and tell me the version it prints:
@@ -36,7 +36,7 @@ can fix it without seeing your logs. It contains no message text either.
 
 4. Have a look at `summary.json` if you like, then send it to me.
 
-If you're curious, `npx github:Impakt-Dot-Dev/quotopsy` on its own prints a readable report
+If you're curious, `npx quotopsy` on its own prints a readable report
 for you, with real names, that stays on your machine.
 
 Please run it only on a personal machine with a personal Claude account, not

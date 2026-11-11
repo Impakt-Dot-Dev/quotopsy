@@ -16,7 +16,7 @@ lists findings the totals do not show, such as cache rebuilds after idle gaps.
 Needs Node 18 or newer.
 
 ```bash
-npx github:Impakt-Dot-Dev/quotopsy
+npx quotopsy
 ```
 
 Or download [quotopsy.mjs](quotopsy.mjs), read it, and run it directly:
@@ -45,7 +45,7 @@ read outside `~/.claude`.
 ## Sharing a summary
 
 ```bash
-node quotopsy.mjs --json --redact --debug > summary.json
+npx quotopsy --json --redact --debug > summary.json
 ```
 
 The file holds token totals, counts, timestamps and model names. It holds no
