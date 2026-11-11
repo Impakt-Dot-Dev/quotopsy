@@ -19,7 +19,7 @@ MCP tool names and prompt headings are replaced with placeholders.
 `--debug` adds sizes and counts for any requests the tool handled badly, so I
 can fix it without seeing your logs. It contains no message text either.
 
-**Steps** (needs Node 18 or newer):
+**Steps** (needs Node 20 or newer):
 
 1. Open a terminal in any folder.
 2. Run:

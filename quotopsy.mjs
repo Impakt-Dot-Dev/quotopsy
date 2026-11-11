@@ -570,6 +570,9 @@ function printReport(summary, redact) {
   const pct = (x) => (x * 100).toFixed(1) + "%";
   const usd = (n) => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const title = (t) => t[0].toUpperCase() + t.slice(1);
+  // Dates in the reader's own time zone: the logs are in UTC, where an
+  // evening session already belongs to tomorrow.
+  const day = (iso) => { const d = new Date(iso); return iso ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}` : "?"; };
   const WIDTH = 72;
   // Word-wrap to the report width, with a first-line prefix and a hanging indent.
   const wrap = (text, first, hang, style = (t) => t) => {
@@ -585,7 +588,7 @@ function printReport(summary, redact) {
     console.log("  " + out(DIM, "─".repeat(WIDTH)));
   };
 
-  console.log(`  ${num(summary.files)} sessions · ${num(summary.requests + summary.unattributedMessages)} requests · ${summary.from?.slice(0, 10)} to ${summary.to?.slice(0, 10)} · ${out(BOLD, usd(summary.totalWeighted))} at API prices`);
+  console.log(`  ${num(summary.files)} sessions · ${num(summary.requests + summary.unattributedMessages)} requests · ${day(summary.from)} to ${day(summary.to)} · ${out(BOLD, usd(summary.totalWeighted))} at API prices`);
   if (redact) console.log(out(DIM, "  Names of MCP servers, MCP tools and prompt sections are replaced with placeholders"));
   console.log();
 

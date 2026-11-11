@@ -17,7 +17,7 @@ model, and by thread (the main conversation and each subagent).
 
 ## Run it
 
-Needs Node 18 or newer.
+Needs Node 20 or newer.
 
 ```bash
 npx quotopsy
