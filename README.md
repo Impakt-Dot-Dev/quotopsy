@@ -2,6 +2,12 @@
 
 Explains where your Claude Code usage went, weighted by token type.
 
+```bash
+npx quotopsy
+```
+
+<img src="docs/report.png" width="720" alt="A Quotopsy report: ranked fixes with their estimated share of cost, then usage by category">
+
 It reads the session logs Claude Code already keeps on your machine and
 estimates which part of the context each token belongs to: tool schemas,
 system prompt, MCP server instructions, tool results, history, output. It then
