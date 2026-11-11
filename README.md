@@ -32,6 +32,8 @@ Needs Node 20 or newer.
 | `--json` | Print the summary as JSON. |
 | `--redact` | Replace MCP server names, MCP tool names and prompt headings with placeholders. |
 | `--debug` | With `--json`, add structure-only diagnostics. No message text. |
+| `--doctor` | Print a short diagnostic to paste into an issue: versions, counts and sizes. No names, paths or text. |
+| `--version` | Print the version. |
 
 Days are read in your local time zone.
 
@@ -60,6 +62,18 @@ npx quotopsy --json --redact --debug > summary.json
 
 The file holds token totals, counts, timestamps and model names. No prompts,
 code, file paths or tool output.
+
+## Something looks wrong?
+
+The report ends with a health line that says when its figures deserve less
+trust. To report a problem, paste the output of this into
+[an issue](https://github.com/Impakt-Dot-Dev/quotopsy/issues):
+
+```bash
+npx quotopsy --doctor
+```
+
+The tool never sends anything itself. You choose what to share.
 
 ## Limits
 

@@ -36,6 +36,8 @@ const PRICES = {
 // Models missing from the table are priced like the newest listed model of
 // the same family, and reported so the reader knows.
 const FAMILY = { fable: "claude-fable-5-2", mythos: "claude-mythos-5-2", opus: "claude-opus-5-5", sonnet: "claude-sonnet-5-5", haiku: "claude-haiku-5-5" };
+// Kept equal to "version" in package.json; a test checks it.
+export const VERSION = "0.4.2";
 const MCP = "MCP server: ", INSTRUCTIONS = "MCP instructions: ";
 const isMcp = (name) => name.startsWith("mcp__");
 const count = (map, key) => map.set(key, (map.get(key) ?? 0) + 1);
@@ -677,6 +679,55 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
   return summary;
 }
 
+// Signs that the numbers deserve less trust than usual, from the summary
+// alone. An empty list means none were found.
+export function health(summary) {
+  const off = [];
+  const share = (n, of) => (of ? n / of : 0), pct = (x) => (x * 100).toFixed(0) + "%";
+  if (summary.filesFailed) off.push(`${summary.filesFailed} session file${summary.filesFailed > 1 ? "s" : ""} could not be read`);
+  // Request records exist from Claude Code 2.1.300; unattributed usage on a
+  // newer version means the log format is not being read as expected.
+  const supported = (v) => { const [a, b, c] = v.split(".").map(Number); return a > 2 || (a === 2 && (b > 1 || (b === 1 && c >= 300))); };
+  const recent = Object.entries(summary.claudeCodeVersions).filter(([v]) => supported(v));
+  const lost = recent.reduce((n, [, c]) => n + c.unattributed, 0), all = recent.reduce((n, [, c]) => n + c.attributed + c.unattributed, 0);
+  if (share(lost, all) > 0.02) off.push(`${pct(share(lost, all))} of requests on Claude Code 2.1.300 or newer could not be attributed`);
+  if (summary.charsPerToken.shareOutside2to4_5 > 0.05) off.push(`${pct(summary.charsPerToken.shareOutside2to4_5)} of prompts were rebuilt at an unlikely size`);
+  if (share(summary.missingBlobs, summary.requests) > 0.05) off.push(`${summary.missingBlobs} messages were missing from the log`);
+  if (share(summary.requestsWithoutResponse, summary.requests + summary.requestsWithoutResponse) > 0.2) off.push(`${pct(share(summary.requestsWithoutResponse, summary.requests + summary.requestsWithoutResponse))} of logged requests have no response`);
+  const unknown = summary.cacheRebuilds.filter((r) => r.cause === "unknown").length;
+  if (share(unknown, summary.cacheRebuilds.length) > 0.3 && unknown > 2) off.push(`${unknown} cache rebuilds have no identified cause`);
+  return off;
+}
+
+// What --doctor prints: versions, counts and sizes that describe how well the
+// logs were read. No names, paths or text, so it can be pasted into an issue.
+function printDoctor(summary, ms) {
+  const line = (label, value) => console.log(`${(label + ":").padEnd(22)}${value}`);
+  const counts = (o) => Object.entries(o).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join(", ") || "none";
+  // Type names come from Claude Code; anything that does not look like one is not printed.
+  const typeNames = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [/^[A-Za-z0-9_-]{1,40}$/.test(k) ? k : "(other)", v]));
+  const c = summary.charsPerToken, sig = summary.thinkingSignatures, off = health(summary);
+  console.log("```");
+  line("quotopsy", VERSION);
+  line("runtime", `${globalThis.Deno ? "deno " + globalThis.Deno.version.deno : "node " + process.versions.node}, ${process.platform} ${process.arch}`);
+  line("read in", `${(ms / 1000).toFixed(1)}s, ${summary.filesScanned ? Math.round(ms / summary.filesScanned) : 0} ms per session`);
+  line("period", summary.since || summary.until ? `${summary.since ?? "start"} to ${summary.until ?? "end"}` : "all logs");
+  line("sessions", `${summary.files} counted, ${summary.filesScanned} scanned, ${summary.filesFailed} unreadable`);
+  line("requests", `${summary.requests} attributed, ${summary.unattributedMessages} without a request record, ${summary.requestsWithoutResponse} without a response`);
+  line("claude code", Object.entries(summary.claudeCodeVersions).map(([v, n]) => `${v} (${n.attributed} ok, ${n.unattributed} not)`).join(", ") || "none");
+  line("models", counts(summary.models));
+  line("chars per token", c.median === undefined ? "no request rebuilt in full" : `p5 ${c.p5.toFixed(2)}, median ${c.median.toFixed(2)}, p95 ${c.p95.toFixed(2)}, ${(c.shareOutside2to4_5 * 100).toFixed(1)}% outside 2 to 4.5`);
+  line("missing messages", summary.missingBlobs);
+  line("thinking signatures", sig.thinkingTokens ? `${sig.responses} responses, ${(sig.chars / sig.thinkingTokens).toFixed(2)} chars per thinking token` : "none");
+  line("cache rebuilds", counts(Object.fromEntries([...new Set(summary.cacheRebuilds.map((r) => r.cause))].map((cause) => [cause, summary.cacheRebuilds.filter((r) => r.cause === cause).length]))));
+  line("mcp servers", `${summary.byMcpServer.length} (${counts(Object.fromEntries([...new Set(summary.byMcpServer.map((r) => r.verdict))].map((v) => [v, summary.byMcpServer.filter((r) => r.verdict === v).length])))})`);
+  line("record types", counts(typeNames(summary.debug.recordTypes)));
+  line("injected context", counts(typeNames(Object.fromEntries(Object.entries(summary.injectedByType).map(([type, a]) => [type, a.count])))));
+  line("unattributed", counts(summary.debug.unattributed));
+  line("health", off.length ? off.join("; ") : "nothing looks off");
+  console.log("```");
+}
+
 // Terminal styling. Progress and banner go to stderr so piped or redirected
 // output stays clean; colour is used only on a terminal that wants it.
 const noColor = globalThis.Deno ? globalThis.Deno.noColor : "NO_COLOR" in process.env;
@@ -783,12 +834,14 @@ function printReport(summary, redact) {
   }
 
   heading("HOW TO READ THIS");
+  const off = health(summary);
   const notes = [
     "Every figure is an estimate. Usage is priced at published API rates per model; how weekly limits weight it is not published.",
     "By MCP server: connected is what its instructions, tool names and loaded schemas cost whether or not you call it; used is its calls and their results. Disable one for a project with /mcp disable <name>.",
     "By tool: schema is its definition loaded in every request; calling is writing its calls and re-reading them later; results is its output kept in context.",
     ...Object.entries(summary.assumedPricing).map(([model, as]) => `No published price known for ${model}; priced as ${as}.`),
-    `Check: ${summary.charsPerToken.median?.toFixed(2)} characters per token (median), ${(summary.charsPerToken.shareOutside2to4_5 * 100).toFixed(1)}% of requests reconstructed poorly, ${num(summary.unattributedMessages)} requests without a request record.`,
+    off.length ? `Health: ${off.length} thing${off.length > 1 ? "s" : ""} look${off.length > 1 ? "" : "s"} off, so read the figures with more caution: ${off.join("; ")}. To report it, paste the output of npx quotopsy --doctor into an issue.`
+      : `Health: nothing looks off (${summary.charsPerToken.median?.toFixed(2) ?? "?"} characters per token, ${num(summary.unattributedMessages)} requests without a request record).`,
     `Claude Code versions: ${Object.entries(summary.claudeCodeVersions).map(([v, c]) => `${v} (${num(c.attributed + c.unattributed)})`).join(", ")}.`,
     ...(summary.filesFailed ? [`${num(summary.filesFailed)} session files could not be read and are left out.`] : []),
     "Nothing left this machine. For a shareable summary: npx quotopsy --json --redact",
@@ -812,7 +865,10 @@ export function parseDay(text, addDays = 0, now = new Date()) {
 
 function main() {
   const args = process.argv.slice(2);
-  const asJson = args.includes("--json"), redact = args.includes("--redact"), debug = args.includes("--debug");
+  if (args.includes("--version")) return console.log(VERSION);
+  // --doctor always redacts: its output is meant to be pasted in public.
+  const doctor = args.includes("--doctor");
+  const asJson = args.includes("--json"), redact = doctor || args.includes("--redact"), debug = doctor || args.includes("--debug");
   // --since=DAY and --until=DAY, also accepted as two words.
   const period = {};
   for (const name of ["since", "until"]) {
@@ -854,7 +910,10 @@ function main() {
     process.stderr.write(`\r\x1b[2K  ${err(GREEN, "✓")} Read ${num(summary.files)} sessions and ${num(summary.requests + summary.unattributedMessages)} requests in ${((Date.now() - started) / 1000).toFixed(1)}s, on this machine only\n\n`);
   }
 
-  if (asJson) {
+  if (doctor) {
+    printDoctor(summary, Date.now() - started);
+    if (process.stderr.isTTY) process.stderr.write("\n  Nothing above names a server, a tool, a file or any text. Paste it into an issue:\n  https://github.com/Impakt-Dot-Dev/quotopsy/issues\n\n");
+  } else if (asJson) {
     console.log(JSON.stringify(summary, null, 2));
     if (process.stderr.isTTY && !process.stdout.isTTY) process.stderr.write(`  Summary written${redact ? ", with names replaced by placeholders" : ""}. Have a look before you share it.\n\n`);
   } else if (!summary.totalWeighted) {

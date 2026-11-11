@@ -8,7 +8,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { analyze, hashMessage, parseDay } from "../quotopsy.mjs";
+import { readFileSync } from "node:fs";
+import { analyze, hashMessage, health, parseDay, VERSION } from "../quotopsy.mjs";
 
 const OPUS = "claude-opus-5-5"; // $4 in, $0.20 cache read, $8 one-hour write, $20 out, per million tokens
 const M = 1e-6;
@@ -656,4 +657,41 @@ test("the never-called finding names the three costliest servers and counts the 
   s.request("r1", { tail: [s.blob({ role: "system", content: [{ type: "text", text: "Deferred tools:\n" + lines + "\n" }] }), s.blob(text("hi"))] }).assistant("r1", { write1h: 2000 });
   const finding = run([s]).findings.find((f) => f.what.includes("never called"));
   assert.equal(finding.what, "5 MCP servers connected but never called; costliest first: alpha, beta, gamma and 2 more");
+});
+
+test("the version in the tool matches package.json", () => {
+  assert.equal(VERSION, JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version);
+});
+
+test("health is silent on clean logs and names what looks off otherwise", () => {
+  const session = (tokens) => {
+    const s = new Session().shape("shape", [{ name: "Bash", description: "b".repeat(100) }], ["system"]);
+    return s.request("r1", { tail: [s.blob(text("hi ".repeat(200)))] }).assistant("r1", { write1h: tokens });
+  };
+  // Billed at about three characters per token, as real prompts are.
+  const chars = run([session(1000)]).charsPerToken.median * 1000;
+  assert.deepEqual(health(run([session(Math.round(chars / 3))])), []);
+  // Billed at a size the rebuilt prompt cannot explain.
+  assert.match(health(run([session(Math.round(chars * 2))])).join("; "), /100% of prompts were rebuilt at an unlikely size/);
+
+  // A supported Claude Code version whose responses have no request records.
+  const lost = new Session("2.1.320").assistant(null, { fresh: 1000 }).assistant(null, { fresh: 1000 }, { minute: 1 });
+  assert.match(health(run([lost])).join("; "), /100% of requests on Claude Code 2\.1\.300 or newer could not be attributed/);
+  // The same on an old version is expected, not a problem.
+  const old = new Session("2.1.250").assistant(null, { fresh: 1000 });
+  assert.deepEqual(health(run([old])), []);
+});
+
+test("--doctor prints counts and versions, and no names or text", () => {
+  const cli = fileURLToPath(new URL("../quotopsy.mjs", import.meta.url));
+  const s = mcpSession();
+  s.user("SECRET-PROMPT-TEXT");
+  const result = spawnSync(process.execPath, [cli, logsFolder([s]), "--doctor"], { encoding: "utf8", env: { ...process.env, NO_COLOR: "1" } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, new RegExp(`quotopsy: +${VERSION.replaceAll(".", "\\.")}`));
+  assert.match(result.stdout, /requests: +2 attributed/);
+  assert.match(result.stdout, /mcp servers: +3 /);
+  assert.match(result.stdout, /health: +\S/);
+  for (const private_ of ["github", "linear", "Design", "SECRET", "find it", tmpdir()]) assert.ok(!result.stdout.includes(private_), private_);
+  assert.equal(spawnSync(process.execPath, [cli, "--version"], { encoding: "utf8" }).stdout.trim(), VERSION);
 });
