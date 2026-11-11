@@ -1,6 +1,6 @@
 # Quotopsy
 
-Explains where your Claude Code usage went, weighted by token type.
+Shows where your Claude Code usage went, and what to fix.
 
 ```bash
 npx quotopsy
@@ -9,49 +9,39 @@ npx quotopsy
 <img src="docs/report.png" width="720" alt="A Quotopsy report: ranked fixes with their estimated share of cost, then usage by category">
 
 It reads the session logs Claude Code already keeps on your machine and
-estimates which part of the context each token belongs to: tool schemas,
-system prompt, MCP server instructions, tool results, history, output. It then
-lists findings the totals do not show, such as cache rebuilds after idle gaps.
+estimates what each part of the context cost: tool schemas, system prompt, MCP
+servers, tool results, history, output. Then it ranks what to fix, such as
+cache rebuilds after idle gaps.
 
-The report has five parts: what to fix (ranked), where it went (by category),
-by tool (each tool or MCP server's schema, calls and results added up), by
-model, and by thread (the main conversation and each subagent).
-
-- Runs locally. No network calls, no LLM calls, no dependencies.
+- Local: no network calls, no LLM calls, no dependencies.
 - One readable file: [quotopsy.mjs](quotopsy.mjs).
-- Every attribution is an estimate and is labeled as one.
+- Every figure is an estimate, and labelled as one.
 
-## Run it
+## Options
 
 Needs Node 20 or newer.
-
-```bash
-npx quotopsy
-```
-
-Or download [quotopsy.mjs](quotopsy.mjs), read it, and run it directly:
-
-```bash
-node quotopsy.mjs
-```
 
 | Option | Effect |
 | --- | --- |
 | `[logs-dir]` | Logs to read. Defaults to `~/.claude/projects`. |
-| `--since=DAY` | Only usage from that day on. `DAY` is `YYYY-MM-DD`, or a number of days back such as `7d`. |
+| `--since=DAY` | Only usage from that day on: `YYYY-MM-DD`, or days back such as `7d`. |
 | `--until=DAY` | Only usage up to the end of that day. |
-| `--json` | Print the summary as JSON instead of a report. |
-| `--redact` | Replace MCP server names, MCP tool names and prompt section headings with placeholders. |
-| `--debug` | With `--json`, add structure-only diagnostics for requests the tool handled badly: record types, block types, sizes and counts. No message text. |
+| `--json` | Print the summary as JSON. |
+| `--redact` | Replace MCP server names, MCP tool names and prompt headings with placeholders. |
+| `--debug` | With `--json`, add structure-only diagnostics. No message text. |
 
-To see whether a change of setup or habits helped, compare two periods:
+Days are read in your local time zone.
+
+## Did a change help?
+
+Compare the period before it with the period after:
 
 ```bash
 npx quotopsy --until=2026-11-10
 npx quotopsy --since=2026-11-11
 ```
 
-Days are read in your local time zone.
+## Check it yourself
 
 To enforce "read these logs, no network" instead of trusting the code:
 
@@ -59,47 +49,29 @@ To enforce "read these logs, no network" instead of trusting the code:
 deno run --allow-read=$HOME/.claude --deny-net quotopsy.mjs $HOME/.claude/projects
 ```
 
-The logs path is passed explicitly so the script needs no permission beyond
-reading that folder. Under these flags Deno refuses any network call and any
-read outside `~/.claude`.
-
-## Sharing a summary
+## Share a summary
 
 ```bash
 npx quotopsy --json --redact --debug > summary.json
 ```
 
-The file holds token totals, counts, timestamps and model names. It holds no
-prompts, code, file paths or tool output. Its first field, `contains`, states
-this and whether names were redacted.
-
-## Tests
-
-```bash
-npm test
-```
-
-The tests build synthetic session logs and never read real ones. When a new
-kind of log turns up, add a case that reproduces its structure, not its
-content.
+The file holds token totals, counts, timestamps and model names. No prompts,
+code, file paths or tool output.
 
 ## Limits
 
 - Sees only sessions that ran on this machine. Cloud sessions count against
-  the same plan limits but leave no logs here, so they are not in the report.
-- Needs Claude Code 2.1.300 or newer for attribution. Older versions do not
-  log the request records it relies on, so their usage shows as
-  "unattributed"; cache rebuilds after idle gaps are still detected from
-  usage alone. Checked on logs from 2.1.300 through 2.1.322.
-- Usage is weighted at published API prices per model (checked 2026-11-10), so
-  shares are shares of API-equivalent cost. How weekly limits weight token
-  types and models is not published.
-- A model missing from the price table is priced like the newest listed model
-  of its family, and the report says so.
-- A message the log does not contain is shown as "unresolved messages" and
-  sized from the usual characters-per-token ratio.
-- Prompt text is split at headings and standalone `<tag>` blocks. Text that
-  follows a heading with no later heading or tag is credited to that heading.
+  the same limits but leave no logs here.
+- Needs Claude Code 2.1.300 or newer to attribute usage. Older logs show as
+  "unattributed", though cache rebuilds after idle gaps are still found.
+- Costs are weighted at published API prices (checked 2026-11-10). How plan
+  limits weight token types and models is not published.
+- A model missing from the price table is priced like the newest model of its
+  family, and the report says so.
+
+## Tests
+
+`npm test`. The tests build synthetic logs and never read real ones.
 
 ## License
 
