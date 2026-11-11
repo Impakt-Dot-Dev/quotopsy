@@ -600,7 +600,7 @@ function printReport(summary, redact) {
     `Check: ${summary.charsPerToken.median?.toFixed(2)} characters per token (median), ${(summary.charsPerToken.shareOutside2to4_5 * 100).toFixed(1)}% of requests reconstructed poorly, ${num(summary.unattributedMessages)} requests without a request record.`,
     `Claude Code versions: ${Object.entries(summary.claudeCodeVersions).map(([v, c]) => `${v} (${num(c.attributed + c.unattributed)})`).join(", ")}.`,
     ...(summary.filesFailed ? [`${num(summary.filesFailed)} session files could not be read and are left out.`] : []),
-    "Nothing left this machine. For a shareable summary: node quotopsy.mjs --json --redact",
+    "Nothing left this machine. For a shareable summary: npx quotopsy --json --redact",
   ];
   for (const note of notes) wrap(note, "  · ", "    ", (t) => out(DIM, t));
   console.log();
@@ -629,7 +629,7 @@ function main() {
     if (e?.code !== "ENOENT" && e?.code !== "ENOTDIR") throw e;
   }
   if (!summary?.files) {
-    console.error(`No Claude Code session logs found in ${root}\nPass the folder that holds them: node quotopsy.mjs <logs-dir>`);
+    console.error(`No Claude Code session logs found in ${root}\nPass the folder that holds them: npx quotopsy <logs-dir>`);
     process.exit(1);
   }
   if (process.stderr.isTTY) {

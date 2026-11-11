@@ -1,6 +1,6 @@
 {
   "name": "quotopsy",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Explains where your Claude Code usage went, weighted by token type. Local only: no network, no LLM calls.",
   "keywords": [
     "claude-code",
