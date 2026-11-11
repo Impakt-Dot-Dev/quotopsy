@@ -1,4 +1,4 @@
-# Quotopsy (working title)
+# Quotopsy
 
 Explains where your Claude Code usage went, weighted by token type.
 
@@ -8,7 +8,7 @@ system prompt, MCP server instructions, tool results, history, output. It then
 lists findings the totals do not show, such as cache rebuilds after idle gaps.
 
 - Runs locally. No network calls, no LLM calls, no dependencies.
-- One readable file: [prototype.mjs](prototype.mjs).
+- One readable file: [quotopsy.mjs](quotopsy.mjs).
 - Every attribution is an estimate and is labeled as one.
 
 ## Run it
@@ -16,7 +16,13 @@ lists findings the totals do not show, such as cache rebuilds after idle gaps.
 Needs Node 18 or newer.
 
 ```bash
-node prototype.mjs
+npx github:Impakt-Dot-Dev/quotopsy
+```
+
+Or download [quotopsy.mjs](quotopsy.mjs), read it, and run it directly:
+
+```bash
+node quotopsy.mjs
 ```
 
 | Option | Effect |
@@ -29,7 +35,7 @@ node prototype.mjs
 To enforce "read these logs, no network" instead of trusting the code:
 
 ```bash
-deno run --allow-read=$HOME/.claude --deny-net prototype.mjs $HOME/.claude/projects
+deno run --allow-read=$HOME/.claude --deny-net quotopsy.mjs $HOME/.claude/projects
 ```
 
 The logs path is passed explicitly so the script needs no permission beyond
@@ -39,7 +45,7 @@ read outside `~/.claude`.
 ## Sharing a summary
 
 ```bash
-node prototype.mjs --json --redact --debug > summary.json
+node quotopsy.mjs --json --redact --debug > summary.json
 ```
 
 The file holds token totals, counts, timestamps and model names. It holds no
@@ -58,6 +64,8 @@ content.
 
 ## Limits
 
+- Sees only sessions that ran on this machine. Cloud sessions count against
+  the same plan limits but leave no logs here, so they are not in the report.
 - Needs Claude Code 2.1.300 or newer for attribution. Older versions do not
   log the request records it relies on, so their usage shows as
   "unattributed"; cache rebuilds after idle gaps are still detected from
@@ -71,3 +79,7 @@ content.
   sized from the usual characters-per-token ratio.
 - Prompt text is split at headings and standalone `<tag>` blocks. Text that
   follows a heading with no later heading or tag is credited to that heading.
+
+## License
+
+[MIT](LICENSE)

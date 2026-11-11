@@ -8,13 +8,18 @@
     "test": "node --test test/*.test.mjs"
   },
   "bin": {
-    "quotopsy": "prototype.mjs"
+    "quotopsy": "quotopsy.mjs"
   },
   "files": [
-    "prototype.mjs"
+    "quotopsy.mjs"
   ],
   "engines": {
     "node": ">=18"
   },
-  "license": "UNLICENSED"
+  "license": "MIT",
+  "homepage": "https://quotopsy.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Impakt-Dot-Dev/quotopsy.git"
+  }
 }

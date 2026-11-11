@@ -1,9 +1,8 @@
 #!/usr/bin/env node
-// Quotopsy go/no-go prototype (spec build step 1).
-// Reads Claude Code session logs locally and estimates which part of the
+// Quotopsy: reads Claude Code session logs locally and estimates which part of the
 // context each weighted token belongs to. No network, no LLM calls, no deps.
 //
-//   node prototype.mjs [logs-dir] [--json] [--redact] [--debug]
+//   node quotopsy.mjs [logs-dir] [--json] [--redact] [--debug]
 //
 // --redact replaces MCP server names, MCP tool names and prompt section
 // headings with numbered placeholders, for output that will be shared.
@@ -11,7 +10,7 @@
 // types, sizes and counts for requests the tool handled badly). No text.
 //
 // Uses only node: builtins, so it also runs under
-//   deno run --allow-read=$HOME/.claude --deny-net prototype.mjs $HOME/.claude/projects
+//   deno run --allow-read=$HOME/.claude --deny-net quotopsy.mjs $HOME/.claude/projects
 // (the path is explicit because looking up the home directory needs a
 // further Deno permission)
 import { createHash } from "node:crypto";
@@ -316,7 +315,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       const lost = prev ? Math.min(u.write, prev.prompt - u.read) : 0;
       const gapMin = prev ? (Date.parse(ts) - Date.parse(prev.ts)) / 60000 : 0;
       if (prev && u.read < 0.8 * prev.prompt && lost > 5000 && gapMin > prev.ttlMin) {
-        rebuilds.push({ cause: "idle longer than the cache lifetime", tokens: lost, wasted: lost * (writeCost / u.write - w.read), at: ts, gapMin: Math.round(gapMin) });
+        rebuilds.push({ cause: "idle longer than the cache lifetime", tokens: lost, wasted: lost * (writeCost / u.write - w.read), at: ts, gapMin: Math.round(gapMin), version: version ?? "unknown" });
       }
       lastOrphan.set(thread, { prompt, ts, ttlMin: u.write1h || !u.write ? 60 : 5 });
     }
@@ -434,7 +433,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
           : keep < baseLen ? "conversation edited or compacted"
           : req.shapeHash !== prev.shapeHash ? "tool list or system prompt changed"
           : "unknown";
-        rebuilds.push({ cause, tokens: lost, wasted: lost * (writeRate - w.read), at: req.timestamp, gapMin: Math.round(gapMin) });
+        rebuilds.push({ cause, tokens: lost, wasted: lost * (writeRate - w.read), at: req.timestamp, gapMin: Math.round(gapMin), version: req.version ?? "unknown" });
         if (debugOn && cause === "unknown" && debug.unknownRebuilds.length < DEBUG_CAP) {
           debug.unknownRebuilds.push({
             version: req.version, source, gapMin, previousPrompt: prev.prompt, usage: u, ttlMin: prev.ttlMin,
@@ -601,7 +600,7 @@ function printReport(summary, redact) {
     `Check: ${summary.charsPerToken.median?.toFixed(2)} characters per token (median), ${(summary.charsPerToken.shareOutside2to4_5 * 100).toFixed(1)}% of requests reconstructed poorly, ${num(summary.unattributedMessages)} requests without a request record.`,
     `Claude Code versions: ${Object.entries(summary.claudeCodeVersions).map(([v, c]) => `${v} (${num(c.attributed + c.unattributed)})`).join(", ")}.`,
     ...(summary.filesFailed ? [`${num(summary.filesFailed)} session files could not be read and are left out.`] : []),
-    "Nothing left this machine. For a shareable summary: node prototype.mjs --json --redact",
+    "Nothing left this machine. For a shareable summary: node quotopsy.mjs --json --redact",
   ];
   for (const note of notes) wrap(note, "  · ", "    ", (t) => out(DIM, t));
   console.log();
@@ -630,7 +629,7 @@ function main() {
     if (e?.code !== "ENOENT" && e?.code !== "ENOTDIR") throw e;
   }
   if (!summary?.files) {
-    console.error(`No Claude Code session logs found in ${root}\nPass the folder that holds them: node prototype.mjs <logs-dir>`);
+    console.error(`No Claude Code session logs found in ${root}\nPass the folder that holds them: node quotopsy.mjs <logs-dir>`);
     process.exit(1);
   }
   if (process.stderr.isTTY) {

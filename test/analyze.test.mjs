@@ -6,7 +6,7 @@ import { chmodSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { analyze, hashMessage } from "../prototype.mjs";
+import { analyze, hashMessage } from "../quotopsy.mjs";
 
 const OPUS = "claude-opus-5-5"; // $4 in, $0.20 cache read, $8 one-hour write, $20 out, per million tokens
 const M = 1e-6;
@@ -116,6 +116,7 @@ test("reports a cache rebuilt after an idle gap, with what it cost", () => {
   assert.equal(rebuild.cause, "idle longer than the cache lifetime");
   assert.equal(rebuild.tokens, 19000); // the 20,000-token prompt minus the 1,000 read back
   assert.equal(rebuild.gapMin, 180);
+  assert.equal(rebuild.version, "2.1.322"); // the Claude Code version that made the request
   near(rebuild.wasted, 19000 * (8 - 0.2) * M, "cost above a warm cache");
   assert.match(summary.findings[0].what, /Cache rebuilt 1x: idle/);
 });
