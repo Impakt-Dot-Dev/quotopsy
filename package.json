@@ -1,8 +1,15 @@
 {
   "name": "quotopsy",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Explains where your Claude Code usage went, weighted by token type. Local only: no network, no LLM calls.",
-  "private": true,
+  "keywords": [
+    "claude-code",
+    "claude",
+    "usage",
+    "tokens",
+    "prompt-cache",
+    "cli"
+  ],
   "type": "module",
   "scripts": {
     "test": "node --test test/*.test.mjs"
@@ -21,5 +28,8 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Impakt-Dot-Dev/quotopsy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Impakt-Dot-Dev/quotopsy/issues"
   }
 }
