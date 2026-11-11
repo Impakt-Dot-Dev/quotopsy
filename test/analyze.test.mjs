@@ -2,10 +2,12 @@
 // When a new kind of log turns up in the wild, add a case that reproduces its
 // structure (record types and shapes), not its content.
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { chmodSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { analyze, hashMessage } from "../quotopsy.mjs";
 
 const OPUS = "claude-opus-5-5"; // $4 in, $0.20 cache read, $8 one-hour write, $20 out, per million tokens
@@ -46,11 +48,17 @@ function usageOf({ fresh = 0, read = 0, write1h = 0, write5m = 0, output = 0, th
   };
 }
 
-// Writes sessions into a fresh logs folder and analyses it.
-function run(sessions, options) {
+// Writes sessions into a fresh logs folder.
+function logsFolder(sessions) {
   const root = mkdtempSync(join(tmpdir(), "quotopsy-test-"));
   mkdirSync(join(root, "project"));
   sessions.forEach((s, i) => writeFileSync(join(root, "project", `session-${i}.jsonl`), s.lines.join("\n") + "\n"));
+  return root;
+}
+
+// Analyses sessions written into a fresh logs folder.
+function run(sessions, options) {
+  const root = logsFolder(sessions);
   const summary = analyze(root, options);
   // A session that throws is skipped, which would otherwise hide a bug here.
   assert.equal(summary.filesFailed, 0, "a session file failed to parse");
@@ -448,4 +456,22 @@ test("thinking is not charged to the tool the response went on to call", () => {
 test("redaction replaces MCP server names in the per-tool table, not built-in tools", () => {
   const names = run([toolConversation().s], { redact: true }).byTool.map((t) => t.name).sort();
   assert.deepEqual(names, ["Bash", "server 1"]);
+});
+
+// The printed report, as the command line produces it in a given time zone.
+function report(sessions, timeZone) {
+  const cli = fileURLToPath(new URL("../quotopsy.mjs", import.meta.url));
+  const result = spawnSync(process.execPath, [cli, logsFolder(sessions)], { encoding: "utf8", env: { ...process.env, TZ: timeZone, NO_COLOR: "1" } });
+  assert.equal(result.status, 0, result.stderr);
+  return result.stdout;
+}
+
+test("the report shows dates in the reader's time zone, not UTC", () => {
+  // 10:00 UTC on November 1 and 01:00 UTC on November 2.
+  const session = [new Session().assistant(null, { fresh: 1000, output: 100 }, { minute: 0 }).assistant(null, { fresh: 1000, output: 100 }, { minute: 900 })];
+  // Los Angeles is still on the evening of the 1st at 01:00 UTC on the 2nd.
+  assert.match(report(session, "America/Los_Angeles"), /2026-11-01 to 2026-11-01/);
+  assert.match(report(session, "UTC"), /2026-11-01 to 2026-11-02/);
+  // Kiritimati, 14 hours ahead, is already on the 2nd at 10:00 UTC on the 1st.
+  assert.match(report(session, "Pacific/Kiritimati"), /2026-11-02 to 2026-11-02/);
 });
