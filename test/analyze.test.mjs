@@ -283,7 +283,9 @@ test("flags MCP servers that are connected but never called", () => {
   s.request("r1", { tail: [s.blob(text("hi"))] }).assistant("r1", { write1h: 2000 });
   const summary = run([s]);
   const finding = summary.findings.find((f) => f.what.includes("never called"));
-  assert.match(finding.what, /^1 MCP server connected but never called; the largest is jira$/);
+  // Its schemas were in the request although it was never called: the fix names tool search.
+  assert.equal(finding.what, "1 MCP server never called, with schemas loaded anyway; jira");
+  assert.match(finding.fix, /ENABLE_TOOL_SEARCH/);
   const [jira] = summary.byMcpServer;
   assert.deepEqual([jira.name, jira.calls, jira.verdict, jira.used], ["jira", 0, "never called", 0]);
   near(finding.effect, jira.share, "the finding is the server's whole cost");
@@ -607,7 +609,11 @@ test("lists every connected MCP server with what it cost to keep and to use", ()
   const all = summary.byMcpServer.reduce((n, r) => n + r.cost, 0);
   assert.ok(all < summary.totalWeighted);
   near(summary.categories.reduce((n, c) => n + c.weighted, 0), summary.totalWeighted, "categories still add up");
-  assert.match(summary.findings.find((f) => f.what.includes("never called")).what, /^1 MCP server connected but never called/);
+  // linear only had its tool names listed, so the advice is to disable it, not to look at tool search.
+  const idle = summary.findings.find((f) => f.what.includes("never called"));
+  assert.equal(idle.what, "1 MCP server connected but never called; costliest first: linear");
+  assert.doesNotMatch(idle.fix, /ENABLE_TOOL_SEARCH/);
+  near(idle.effect, server("linear").share, "the finding is that server's cost");
   assertFinite(summary);
 });
 
@@ -640,4 +646,14 @@ test("a resumed session's copied responses are not counted a second time", () =>
     assert.equal(summary.unattributedMessages, 0);
     near(summary.totalWeighted, (1000 * 8 + 100 * 20) * M, "counted once");
   }
+});
+
+test("the never-called finding names the three costliest servers and counts the rest", () => {
+  const names = ["alpha", "beta", "gamma", "delta", "epsilon"];
+  // Each server is listed by name only; longer tool names cost more.
+  const lines = names.map((n, i) => `mcp__${n}__${"t".repeat(40 * (names.length - i))}`).join("\n");
+  const s = new Session().shape("shape", [{ name: "Bash", description: "b".repeat(100) }], ["system"]);
+  s.request("r1", { tail: [s.blob({ role: "system", content: [{ type: "text", text: "Deferred tools:\n" + lines + "\n" }] }), s.blob(text("hi"))] }).assistant("r1", { write1h: 2000 });
+  const finding = run([s]).findings.find((f) => f.what.includes("never called"));
+  assert.equal(finding.what, "5 MCP servers connected but never called; costliest first: alpha, beta, gamma and 2 more");
 });

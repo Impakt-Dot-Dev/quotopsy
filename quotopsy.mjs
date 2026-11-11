@@ -607,11 +607,23 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     const verdict = !withTools.has(who) ? "calls unknown" : !n ? "never called" : loaded && n / loaded <= 0.05 ? "rarely called" : "in use";
     return { name: who.slice(MCP.length), calls: n, loadedIn: loaded, carried, used, cost: carried + used, share: share(carried + used), verdict };
   }).sort((a, b) => b.cost - a.cost);
+  // Never-called servers, costliest first, in two groups with different fixes:
+  // those whose full schemas were loaded anyway, and those that only cost
+  // their instructions and tool names.
   const idle = byMcpServer.filter((r) => r.verdict === "never called");
-  if (idle.length) {
-    const most = idle[0].share >= 0.001 ? `; the largest is ${idle[0].name}` : "";
-    findings.push({ effect: idle.reduce((n, r) => n + r.share, 0), what: `${idle.length} MCP server${idle.length > 1 ? "s" : ""} connected but never called${most}`, fix: "Disable the ones this project does not need: /mcp disable <name>. BY MCP SERVER lists them. Their instructions and tool names load either way." });
-  }
+  const top = (list) => list.slice(0, 3).map((r) => r.name).join(", ") + (list.length > 3 ? ` and ${list.length - 3} more` : "");
+  const plural = (list) => `${list.length} MCP server${list.length > 1 ? "s" : ""}`;
+  const loaded = idle.filter((r) => r.loadedIn > 0), listed = idle.filter((r) => !r.loadedIn);
+  if (loaded.length) findings.push({
+    effect: loaded.reduce((n, r) => n + r.share, 0),
+    what: `${plural(loaded)} never called, with schemas loaded anyway; ${top(loaded)}`,
+    fix: "Schemas should load only when a tool is needed: check that ENABLE_TOOL_SEARCH is not set to false. Then disable what this project does not need, at the start of a session: /mcp disable <name>",
+  });
+  if (listed.length) findings.push({
+    effect: listed.reduce((n, r) => n + r.share, 0),
+    what: `${plural(listed)} connected but never called; costliest first: ${top(listed)}`,
+    fix: "Their instructions and tool names load in every request. Disable what this project does not need, at the start of a session: /mcp disable <name>",
+  });
   for (const r of byMcpServer.filter((r) => r.verdict === "calls unknown" && r.share > 0)) {
     findings.push({ effect: r.share, what: `${r.name}: instructions loaded in every session; whether you use it cannot be measured`, fix: "Disconnect it if you do not use it." });
   }
