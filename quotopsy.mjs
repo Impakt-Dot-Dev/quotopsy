@@ -36,7 +36,7 @@ const PRICES = {
 // Models missing from the table are priced like the newest listed model of
 // the same family, and reported so the reader knows.
 const FAMILY = { fable: "claude-fable-5-2", mythos: "claude-mythos-5-2", opus: "claude-opus-5-5", sonnet: "claude-sonnet-5-5", haiku: "claude-haiku-5-5" };
-const MCP = "MCP server: ";
+const MCP = "MCP server: ", INSTRUCTIONS = "MCP instructions: ";
 const isMcp = (name) => name.startsWith("mcp__");
 const count = (map, key) => map.set(key, (map.get(key) ?? 0) + 1);
 
@@ -135,8 +135,11 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     return aliases.get(key);
   }
 
+  // Tool names carry the server name with other characters turned into "_";
+  // do the same to names from instruction headings so the two meet.
+  const serverRow = (server) => MCP + alias("server", String(server).trim().replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 40));
   function toolGroup(name) {
-    return isMcp(name) ? MCP + alias("server", name.split("__")[1]) : "built-in tools";
+    return isMcp(name) ? serverRow(name.split("__")[1]) : "built-in tools";
   }
   // The row a tool's costs add up under: its own for a built-in tool, its
   // server's for an MCP tool.
@@ -166,11 +169,25 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       else if (top) { flush(); inMcp = top[1].startsWith("MCP Server Instructions"); label = alias("section", top[1].slice(0, 40)); }
       // A server's own instructions may contain "## ..." lines; when the log
       // names the servers, only those start a new one.
-      else if (sub && inMcp && (!mcpServers.size || mcpServers.has(sub[1].trim()))) { flush(); label = "MCP instructions: " + alias("server", sub[1].slice(0, 40)); }
+      else if (sub && inMcp && (!mcpServers.size || mcpServers.has(sub[1].trim()))) { flush(); label = INSTRUCTIONS + serverRow(sub[1]).slice(MCP.length); }
       chars += line.length + 1;
     }
     flush();
     return out;
+  }
+
+  // Prompt text -> segments by heading. A server's instructions, and its tool
+  // names where the prompt lists them, are charged to that server as the
+  // cost of keeping it connected.
+  function promptSegments(category, text) {
+    const names = new Map(); // server row -> characters spent naming its tools
+    for (const [name] of text.matchAll(/mcp__[A-Za-z0-9_-]+?__[A-Za-z0-9_-]+/g)) names.set(toolGroup(name), (names.get(toolGroup(name)) ?? 0) + name.length + 1);
+    const named = Math.min(text.length, [...names.values()].reduce((n, c) => n + c, 0));
+    const rest = text.length ? (text.length - named) / text.length : 0;
+    return [
+      ...sections(text).map(([sec, c]) => [category, sec, c * rest, sec.startsWith(INSTRUCTIONS) ? [MCP + sec.slice(INSTRUCTIONS.length), "connected"] : null]),
+      ...[...names].map(([server, c]) => { withTools.add(server); return [category, "MCP tool names", c * named / [...names.values()].reduce((n, x) => n + x, 0), [server, "connected"]]; }),
+    ];
   }
 
   // One logged message -> [category, sub, chars, culprit] segments, in prompt
@@ -179,7 +196,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     const blocks = typeof msg.content === "string" ? [{ type: "text", text: msg.content }] : (Array.isArray(msg.content) ? msg.content : []).filter((b) => b && typeof b === "object");
     return blocks.flatMap((b) => {
       const chars = b.type === "thinking" ? thinkingChars(b) : blockChars(b);
-      if (msg.role === "system") return sections(b.text ?? "").map(([s, c]) => ["injected system messages", s, c]);
+      if (msg.role === "system") return promptSegments("injected system messages", b.text ?? "");
       if (msg.role === "assistant") return [["assistant history", b.type, chars, b.type === "tool_use" ? [culpritOf(String(b.name ?? "unknown")), "calling"] : null]];
       if (b.type === "tool_result") {
         const name = toolNames.get(b.tool_use_id) ?? "(unknown tool)";
@@ -215,6 +232,12 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
           a.count++;
           for (const r of Array.isArray(o.rendered) ? o.rendered : []) a.chars += typeof r?.content === "string" ? r.content.length : 0;
           attachments.set(o.attachment?.type ?? "unknown", a);
+        }
+        if (o.attachment?.type === "deferred_tools_delta" && inRange(o.timestamp)) {
+          // Lists the tools of every connected server, loaded or not.
+          for (const key of ["addedNames", "readdedNames", "surfacedNames"]) for (const n of Array.isArray(o.attachment[key]) ? o.attachment[key] : []) {
+            if (typeof n === "string" && isMcp(n)) { withTools.add(toolGroup(n)); blame([toolGroup(n), "connected"], 0); }
+          }
         }
         if (o.attachment?.type === "mcp_instructions_delta" && Array.isArray(o.attachment.addedNames)) for (const n of o.attachment.addedNames) mcpServers.add(String(n).trim());
       }
@@ -289,25 +312,30 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
   const rebuilds = [];
   // Signature size against billed thinking tokens, to check the estimate above.
   const signatures = { responses: 0, chars: 0, thinkingTokens: 0 };
-  const signatureCheck = (blocks = [], thinkingTokens) => {
-    const chars = blocks.reduce((n, b) => n + (b.type === "thinking" && typeof b.signature === "string" ? b.signature.length : 0), 0);
+  const signatureChars = (blocks = []) => blocks.reduce((n, b) => n + (b.type === "thinking" && typeof b.signature === "string" ? b.signature.length : 0), 0);
+  const signatureCheck = (chars, thinkingTokens) => {
     if (!chars || !thinkingTokens) return;
     signatures.responses++; signatures.chars += chars; signatures.thinkingTokens += thinkingTokens;
   };
   // Per tool or MCP server: what its schema, writing and re-reading its calls,
   // and keeping its results in context cost. ESTIMATES, like every attribution.
+  // For an MCP server, `connected` is what its instructions and listed tool
+  // names cost: paid whether or not its tools are ever loaded or called.
   const culprits = new Map();
   const blame = ([who, field], weighted) => {
-    const c = culprits.get(who) ?? { schema: 0, calling: 0, results: 0 };
+    const c = culprits.get(who) ?? { schema: 0, calling: 0, results: 0, connected: 0 };
     c[field] += weighted; culprits.set(who, c);
   };
+  // Servers whose tools were seen by name, so their calls can be counted.
+  const withTools = new Set();
   // Output spent writing tool calls: the response's non-thinking output, split
   // across its text and tool-call blocks by size.
-  const blameOutput = (blocks = [], cost) => {
+  const outputShares = (blocks = []) => {
     const sized = blocks.filter((b) => b.type !== "thinking" && b.type !== "redacted_thinking").map((b) => [b, blockChars(b)]);
     const all = sized.reduce((n, [, c]) => n + c, 0);
-    for (const [b, c] of sized) if (b.type === "tool_use" && all) blame([culpritOf(String(b.name ?? "unknown")), "calling"], cost * c / all);
+    return sized.filter(([b]) => b.type === "tool_use" && all).map(([b, c]) => [culpritOf(String(b.name ?? "unknown")), c / all]);
   };
+  const blameOutput = (shares, cost) => { for (const [who, part] of shares) blame([who, "calling"], cost * part); };
 
   // Structure-only diagnostics for --debug. Sizes, counts and type names; the
   // only names are tool and section labels, which --redact replaces.
@@ -330,61 +358,29 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
   const clean = { chars: 0, tokens: 0 };
   const UNRESOLVED = "unresolved messages";
 
+  // Responses with no logged request wait until every file's requests are
+  // counted: a resumed session copies earlier responses whose requests are
+  // logged in the file it continues.
+  const pendingOrphans = [], sessions = [];
   for (const [i, file] of files.entries()) {
     onProgress(i, files.length);
     // One unreadable session should not lose the rest.
-    try { if (readSession(file)) stats.files++; } catch { stats.failedFiles++; if (!filtered) stats.files++; }
+    try { sessions.push(readSession(file)); } catch { stats.failedFiles++; if (!filtered) stats.files++; }
   }
+  for (const pending of pendingOrphans) countOrphans(pending);
+  stats.files += sessions.filter((session) => session.active).length;
 
-  // Returns whether the session counts: always, unless a period was asked for
-  // and the session has no usage in it.
+  // Returns the session's state. It counts (`active`) always, unless a period
+  // was asked for and the session has no usage in it.
   function readSession(file) {
     const s = parseSession(file);
-    let active = !filtered;
-    for (const [id, name] of s.toolNames) if (inRange(s.toolTimes.get(id))) { count(calls, toolLabel(name)); count(calls, toolGroup(name)); }
-
-    // Sessions without request records: usage is known, its cause is not.
-    for (const [type, n] of s.recordTypes) debug.recordTypes.set(type, (debug.recordTypes.get(type) ?? 0) + n);
-    const lastOrphan = new Map(); // thread -> its previous message
-    for (const { id, usage, model, version, sidechain, ts, thread } of s.orphans.values()) {
-      if (id && counted.has(id)) continue;
-      counted.add(id);
-      if (!inRange(ts)) {
-        // Outside the period: remember it only as what the next one follows.
-        const u = splitUsage(usage);
-        lastOrphan.set(thread, { prompt: u.fresh + u.write + u.read, ts, ttlMin: u.write1h || !u.write ? 60 : 5 });
-        continue;
-      }
-      active = true;
-      coverage(version, "unattributed");
-      count(stats.models, modelName(model));
-      seen(ts);
-      count(debug.unattributed, `version ${version ?? "unknown"}, ${sidechain ? "subagent" : "main"} thread, file ${s.requests.length ? "has" : "has no"} request records`);
-      const u = splitUsage(usage), w = rates(model, usage);
-      const cat = "unattributed input";
-      stats.unattributed++;
-      bump(cat, "cache read", "read", u.read, u.read * w.read);
-      bump(cat, "cache write", "write", u.write, u.write5m * w.write5m + u.write1h * w.write1h);
-      bump(cat, "fresh input", "fresh", u.fresh, u.fresh * w.fresh);
-      bump("output", "thinking", "output", u.thinking, u.thinking * w.output);
-      bump("output", "text and tool calls", "output", u.output - u.thinking, (u.output - u.thinking) * w.output);
-      blameOutput(s.turns.get(id), (u.output - u.thinking) * w.output);
-      signatureCheck(s.turns.get(id), u.thinking);
-      const writeCost = u.write5m * w.write5m + u.write1h * w.write1h;
-      spend(byModel, modelName(model), u.fresh * w.fresh + writeCost + u.read * w.read, u.output * w.output);
-      spend(byThread, sidechain ? "subagent: (type not logged)" : "main thread", u.fresh * w.fresh + writeCost + u.read * w.read, u.output * w.output);
-
-      // Without request records, usage alone still shows a cache lost to
-      // idle time: little is read back and the prompt is written again.
-      // Other causes cannot be told apart here, so only idle is reported.
-      const prompt = u.fresh + u.write + u.read, prev = lastOrphan.get(thread);
-      const lost = prev ? Math.min(u.write, prev.prompt - u.read) : 0;
-      const gapMin = prev ? (Date.parse(ts) - Date.parse(prev.ts)) / 60000 : 0;
-      if (prev && u.read < 0.8 * prev.prompt && lost > 5000 && gapMin > prev.ttlMin) {
-        rebuilds.push({ cause: "idle longer than the cache lifetime", tokens: lost, wasted: lost * (writeCost / u.write - w.read), at: ts, gapMin: Math.round(gapMin), version: version ?? "unknown" });
-      }
-      lastOrphan.set(thread, { prompt, ts, ttlMin: u.write1h || !u.write ? 60 : 5 });
+    const session = { active: !filtered };
+    for (const [id, name] of s.toolNames) if (inRange(s.toolTimes.get(id))) {
+      count(calls, toolLabel(name)); count(calls, toolGroup(name));
+      if (isMcp(name)) { withTools.add(toolGroup(name)); blame([toolGroup(name), "connected"], 0); }
     }
+
+    for (const [type, n] of s.recordTypes) debug.recordTypes.set(type, (debug.recordTypes.get(type) ?? 0) + n);
 
     // Requests are delta-encoded: messages = base's first `keep` + `tail`.
     const msgLists = new Map();
@@ -400,6 +396,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       if (!res) { if (inRange(req.timestamp)) stats.noResponse++; continue; }
       if (counted.has(req.id)) continue;
       counted.add(req.id);
+      if (res.id) counted.add(res.id);
       if (!inRange(req.timestamp)) {
         // Outside the period: remember it only as what a later request extends.
         const u = splitUsage(res.usage);
@@ -407,7 +404,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
         lastOf.set(hashes[0], answered.get(req.id));
         continue;
       }
-      active = true;
+      session.active = true;
       stats.requests++;
       count(stats.models, modelName(res.model));
       const source = redact ? threadOf(req.querySource) : req.querySource ?? "unknown";
@@ -418,8 +415,8 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       const u = splitUsage(res.usage), w = rates(res.model, res.usage);
       bump("output", "thinking", "output", u.thinking, u.thinking * w.output);
       bump("output", "text and tool calls", "output", u.output - u.thinking, (u.output - u.thinking) * w.output);
-      blameOutput(s.turns.get(res.id), (u.output - u.thinking) * w.output);
-      signatureCheck(s.turns.get(res.id), u.thinking);
+      blameOutput(outputShares(s.turns.get(res.id)), (u.output - u.thinking) * w.output);
+      signatureCheck(signatureChars(s.turns.get(res.id)), u.thinking);
       const inputCost = u.fresh * w.fresh + u.write5m * w.write5m + u.write1h * w.write1h + u.read * w.read;
       spend(byModel, modelName(res.model), inputCost, u.output * w.output);
       spend(byThread, threadOf(req.querySource), inputCost, u.output * w.output);
@@ -428,11 +425,11 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       const shape = s.shapes.get(req.shapeHash) ?? {};
       const tools = (Array.isArray(shape.tools) ? shape.tools : []).filter((t) => t && typeof t === "object").map((t) => [String(t.name ?? "unknown"), t]);
       const system = typeof shape.system === "string" ? [{ text: shape.system }] : Array.isArray(shape.system) ? shape.system : [];
-      for (const g of new Set(tools.map(([name]) => toolGroup(name)))) count(loadedIn, g);
+      for (const g of new Set(tools.map(([name]) => toolGroup(name)))) { count(loadedIn, g); if (g.startsWith(MCP)) withTools.add(g); }
       for (const [name] of tools) if (!isMcp(name)) count(loadedIn, name);
       const segs = [
         ...tools.map(([name, t]) => [toolGroup(name), toolLabel(name), JSON.stringify(t).length, [culpritOf(name), "schema"]]),
-        ...system.flatMap((b) => sections(String(b?.text ?? "")).map(([sec, c]) => ["system prompt", sec, c])),
+        ...system.flatMap((b) => promptSegments("system prompt", String(b?.text ?? ""))),
       ];
       // A message that cannot be found leaves a hole of unknown size.
       let missing = lostPrefix;
@@ -522,8 +519,54 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       answered.set(req.id, { prompt, ts: req.timestamp, model: res.model, shapeHash: req.shapeHash, ttlMin: u.write1h || !u.write ? 60 : 5 });
       lastOf.set(hashes[0], answered.get(req.id));
     }
-    return active;
+    pendingOrphans.push({ session, hasRequests: s.requests.length > 0, list: [...s.orphans.values()].map((o) => ({ ...o, calling: outputShares(s.turns.get(o.id)), signature: signatureChars(s.turns.get(o.id)) })) });
+    return session;
   }
+
+  // Sessions without request records: usage is known, its cause is not.
+  function countOrphans({ session, hasRequests, list }) {
+    const lastOrphan = new Map(); // thread -> its previous message
+    for (const { id, usage, model, version, sidechain, ts, thread, calling, signature } of list) {
+      if (id && counted.has(id)) continue;
+      counted.add(id);
+      if (!inRange(ts)) {
+        // Outside the period: remember it only as what the next one follows.
+        const u = splitUsage(usage);
+        lastOrphan.set(thread, { prompt: u.fresh + u.write + u.read, ts, ttlMin: u.write1h || !u.write ? 60 : 5 });
+        continue;
+      }
+      session.active = true;
+      coverage(version, "unattributed");
+      count(stats.models, modelName(model));
+      seen(ts);
+      count(debug.unattributed, `version ${version ?? "unknown"}, ${sidechain ? "subagent" : "main"} thread, file ${hasRequests ? "has" : "has no"} request records`);
+      const u = splitUsage(usage), w = rates(model, usage);
+      const cat = "unattributed input";
+      stats.unattributed++;
+      bump(cat, "cache read", "read", u.read, u.read * w.read);
+      bump(cat, "cache write", "write", u.write, u.write5m * w.write5m + u.write1h * w.write1h);
+      bump(cat, "fresh input", "fresh", u.fresh, u.fresh * w.fresh);
+      bump("output", "thinking", "output", u.thinking, u.thinking * w.output);
+      bump("output", "text and tool calls", "output", u.output - u.thinking, (u.output - u.thinking) * w.output);
+      blameOutput(calling, (u.output - u.thinking) * w.output);
+      signatureCheck(signature, u.thinking);
+      const writeCost = u.write5m * w.write5m + u.write1h * w.write1h;
+      spend(byModel, modelName(model), u.fresh * w.fresh + writeCost + u.read * w.read, u.output * w.output);
+      spend(byThread, sidechain ? "subagent: (type not logged)" : "main thread", u.fresh * w.fresh + writeCost + u.read * w.read, u.output * w.output);
+
+      // Without request records, usage alone still shows a cache lost to
+      // idle time: little is read back and the prompt is written again.
+      // Other causes cannot be told apart here, so only idle is reported.
+      const prompt = u.fresh + u.write + u.read, prev = lastOrphan.get(thread);
+      const lost = prev ? Math.min(u.write, prev.prompt - u.read) : 0;
+      const gapMin = prev ? (Date.parse(ts) - Date.parse(prev.ts)) / 60000 : 0;
+      if (prev && u.read < 0.8 * prev.prompt && lost > 5000 && gapMin > prev.ttlMin) {
+        rebuilds.push({ cause: "idle longer than the cache lifetime", tokens: lost, wasted: lost * (writeCost / u.write - w.read), at: ts, gapMin: Math.round(gapMin), version: version ?? "unknown" });
+      }
+      lastOrphan.set(thread, { prompt, ts, ttlMin: u.write1h || !u.write ? 60 : 5 });
+    }
+  }
+
 
   const total = [...cats.values()].reduce((n, c) => n + c.weighted, 0);
   const share = (x) => (total ? x / total : 0);
@@ -550,17 +593,27 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
   }
   for (const r of rows.filter((r) => r.name.startsWith(MCP))) {
     const server = r.name.slice(MCP.length);
-    const instr = row("injected system messages")?.subs.find((x) => x.name === "MCP instructions: " + server)?.share ?? 0;
+    const instr = share(culprits.get(r.name)?.connected ?? 0);
     const n = loadedIn.get(r.name) ?? 0, k = r.calls ?? 0;
-    if (k / n > 0.05) continue;
+    // Never-called servers are reported together, below.
+    if (!k || k / n > 0.05) continue;
     findings.push({ effect: r.share + instr, what: `${server}: schemas loaded in ${n} requests, called ${k}x`, fix: "Disable it, or enable it only in the projects that use it." });
   }
-  // Servers whose instructions are injected but whose tools are not loaded up
-  // front (deferred, or named differently), so calls cannot be matched.
-  for (const sub of row("injected system messages")?.subs ?? []) {
-    const server = sub.name.replace("MCP instructions: ", "");
-    if (server === sub.name || row(MCP + server)) continue;
-    findings.push({ effect: sub.share, what: `${server}: instructions loaded in every session; whether you use it cannot be measured`, fix: "Disconnect it if you do not use it." });
+  // Every connected server: what staying connected cost (instructions, tool
+  // names, schemas) against what using it cost (calls and their results).
+  const byMcpServer = [...culprits.entries()].filter(([who]) => who.startsWith(MCP)).map(([who, c]) => {
+    const n = calls.get(who) ?? 0, loaded = loadedIn.get(who) ?? 0, carried = c.connected + c.schema, used = c.calling + c.results;
+    // Calls cannot be matched to a server known only by its instructions.
+    const verdict = !withTools.has(who) ? "calls unknown" : !n ? "never called" : loaded && n / loaded <= 0.05 ? "rarely called" : "in use";
+    return { name: who.slice(MCP.length), calls: n, loadedIn: loaded, carried, used, cost: carried + used, share: share(carried + used), verdict };
+  }).sort((a, b) => b.cost - a.cost);
+  const idle = byMcpServer.filter((r) => r.verdict === "never called");
+  if (idle.length) {
+    const most = idle[0].share >= 0.001 ? `; the largest is ${idle[0].name}` : "";
+    findings.push({ effect: idle.reduce((n, r) => n + r.share, 0), what: `${idle.length} MCP server${idle.length > 1 ? "s" : ""} connected but never called${most}`, fix: "Disable the ones this project does not need: /mcp disable <name>. BY MCP SERVER lists them. Their instructions and tool names load either way." });
+  }
+  for (const r of byMcpServer.filter((r) => r.verdict === "calls unknown" && r.share > 0)) {
+    findings.push({ effect: r.share, what: `${r.name}: instructions loaded in every session; whether you use it cannot be measured`, fix: "Disconnect it if you do not use it." });
   }
   const thinking = row("output")?.subs.find((x) => x.name === "thinking");
   // Thinking is paid for twice: once written as output, then re-read as part
@@ -599,7 +652,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     charsPerToken: { min: cpt[0], p5: q(0.05), median: q(0.5), p95: q(0.95), max: cpt[cpt.length - 1], shareOutside2to4_5: offRatio },
     claudeCodeVersions: Object.fromEntries(stats.versions), querySources: Object.fromEntries(stats.sources),
     totalWeighted: total, categories: rows, cacheRebuilds: rebuilds, findings,
-    byModel: ranked(byModel), byThread: ranked(byThread), byTool,
+    byModel: ranked(byModel), byThread: ranked(byThread), byTool, byMcpServer,
     injectedByType: Object.fromEntries([...attachments].sort((a, b) => b[1].chars - a[1].chars)),
   };
   if (debugOn) {
@@ -695,6 +748,17 @@ function printReport(summary, redact) {
     console.log();
   }
 
+  if (summary.byMcpServer.length) {
+    heading("BY MCP SERVER", "calls  connected       used    share  verdict       ");
+    const shown = summary.byMcpServer.slice(0, 25);
+    for (const r of shown) {
+      const verdict = r.verdict === "in use" ? out(DIM, r.verdict.padEnd(14)) : out(YELLOW, r.verdict.padEnd(14));
+      console.log(`  ${(r.name.length > 22 ? r.name.slice(0, 21) + "…" : r.name).padEnd(22)}${num(r.calls).padStart(6)}${usd(r.carried).padStart(11)}${usd(r.used).padStart(11)}${pct(r.share).padStart(9)}  ${verdict}`);
+    }
+    if (summary.byMcpServer.length > shown.length) console.log(out(DIM, `  and ${summary.byMcpServer.length - shown.length} more`));
+    console.log();
+  }
+
   // Who spent it: shown only when there is more than one to compare.
   for (const [name, list] of [["BY MODEL", summary.byModel], ["BY THREAD", summary.byThread]]) {
     if (list.length < 2) continue;
@@ -709,6 +773,7 @@ function printReport(summary, redact) {
   heading("HOW TO READ THIS");
   const notes = [
     "Every figure is an estimate. Usage is priced at published API rates per model; how weekly limits weight it is not published.",
+    "By MCP server: connected is what its instructions, tool names and loaded schemas cost whether or not you call it; used is its calls and their results. Disable one for a project with /mcp disable <name>.",
     "By tool: schema is its definition loaded in every request; calling is writing its calls and re-reading them later; results is its output kept in context.",
     ...Object.entries(summary.assumedPricing).map(([model, as]) => `No published price known for ${model}; priced as ${as}.`),
     `Check: ${summary.charsPerToken.median?.toFixed(2)} characters per token (median), ${(summary.charsPerToken.shareOutside2to4_5 * 100).toFixed(1)}% of requests reconstructed poorly, ${num(summary.unattributedMessages)} requests without a request record.`,

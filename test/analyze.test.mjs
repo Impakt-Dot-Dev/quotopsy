@@ -277,12 +277,16 @@ test("--redact replaces private names and keeps public ones", () => {
   for (const name of ["Bash", "Environment", "MCP server: server 1", "subagent: agent 1"]) assert.ok(redacted.includes(name), `${name} should remain`);
 });
 
-test("flags an MCP server whose schemas are loaded but never called", () => {
+test("flags MCP servers that are connected but never called", () => {
   const tools = [{ name: "Bash", description: "b".repeat(100) }, { name: "mcp__jira__search", description: "j".repeat(5000) }];
   const s = new Session().shape("shape", tools, ["system"]);
   s.request("r1", { tail: [s.blob(text("hi"))] }).assistant("r1", { write1h: 2000 });
-  const finding = run([s]).findings.find((f) => f.what.startsWith("jira:"));
-  assert.match(finding.what, /schemas loaded in 1 requests, called 0x/);
+  const summary = run([s]);
+  const finding = summary.findings.find((f) => f.what.includes("never called"));
+  assert.match(finding.what, /^1 MCP server connected but never called; the largest is jira$/);
+  const [jira] = summary.byMcpServer;
+  assert.deepEqual([jira.name, jira.calls, jira.verdict, jira.used], ["jira", 0, "never called", 0]);
+  near(finding.effect, jira.share, "the finding is the server's whole cost");
 });
 
 test("sizes injected context by attachment type, without its text", () => {
@@ -566,4 +570,74 @@ test("the thinking finding adds what was written to what was re-read", () => {
   near(finding.effect, written + reread, "both parts");
   assert.match(finding.what, /written as output, .*re-read in later requests/);
   assert.deepEqual(summary.thinkingSignatures, { responses: 0, chars: 0, thinkingTokens: 0 }); // the response itself logged no signature
+});
+
+// A session with three MCP servers: one loaded and called, one only listed by
+// name as a deferred tool, one known only from its instructions.
+function mcpSession() {
+  const tools = [{ name: "Bash", description: "b".repeat(100) }, { name: "mcp__github__search", description: "g".repeat(400) }];
+  const system = "# MCP Server Instructions\n## Design Docs\n" + "d".repeat(300);
+  const s = new Session().shape("shape", tools, [system]);
+  s.add({ type: "attachment", timestamp: at(0), attachment: { type: "mcp_instructions_delta", addedNames: ["Design Docs"] } });
+  s.add({ type: "attachment", timestamp: at(0), attachment: { type: "deferred_tools_delta", addedNames: ["CronCreate", "mcp__linear__create_issue", "mcp__linear__list_issues"] } });
+  const listing = { role: "system", content: [{ type: "text", text: "The following deferred tools are now available:\nCronCreate\nmcp__linear__create_issue\nmcp__linear__list_issues\n" }] };
+  const call = { type: "tool_use", id: "t1", name: "mcp__github__search", input: { q: "x" } };
+  const result = { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "r".repeat(600) }] };
+  s.request("r1", { tail: [s.blob(listing), s.blob(text("find it"))] }).assistant("r1", { write1h: 3000, output: 100 }, { content: [call] });
+  s.request("r2", { base: "r1", keep: 2, tail: [s.blob({ role: "assistant", content: [call] }), s.blob(result)], minute: 1 }).assistant("r2", { read: 3000, write1h: 900, output: 50 }, { minute: 1 });
+  return s;
+}
+
+test("lists every connected MCP server with what it cost to keep and to use", () => {
+  const summary = run([mcpSession()]);
+  const server = (name) => summary.byMcpServer.find((r) => r.name === name);
+  assert.deepEqual(summary.byMcpServer.map((r) => r.name).sort(), ["Design_Docs", "github", "linear"]);
+
+  // Loaded and called: its schema is the cost of keeping it, its calls and results the cost of using it.
+  assert.deepEqual([server("github").calls, server("github").verdict], [1, "in use"]);
+  assert.ok(server("github").carried > 0 && server("github").used > 0);
+  // Never loaded, never called: only its tool names in the prompt cost anything.
+  assert.deepEqual([server("linear").calls, server("linear").verdict, server("linear").used], [0, "never called", 0]);
+  assert.ok(server("linear").carried > 0);
+  // Known only from its instructions: calls cannot be matched to it.
+  assert.equal(server("Design_Docs").verdict, "calls unknown");
+  assert.ok(server("Design_Docs").carried > 0);
+
+  // The per-server costs are parts of the total, not extra.
+  const all = summary.byMcpServer.reduce((n, r) => n + r.cost, 0);
+  assert.ok(all < summary.totalWeighted);
+  near(summary.categories.reduce((n, c) => n + c.weighted, 0), summary.totalWeighted, "categories still add up");
+  assert.match(summary.findings.find((f) => f.what.includes("never called")).what, /^1 MCP server connected but never called/);
+  assertFinite(summary);
+});
+
+test("an instructions heading and a tool name for the same server meet in one row", () => {
+  const tools = [{ name: "mcp__Design_Docs__read", description: "d".repeat(200) }];
+  const s = new Session().shape("shape", tools, ["# MCP Server Instructions\n## Design Docs\n" + "d".repeat(300)]);
+  s.add({ type: "attachment", timestamp: at(0), attachment: { type: "mcp_instructions_delta", addedNames: ["Design Docs"] } });
+  s.request("r1", { tail: [s.blob(text("hi"))] }).assistant("r1", { write1h: 1000 });
+  const summary = run([s]);
+  assert.deepEqual(summary.byMcpServer.map((r) => [r.name, r.verdict]), [["Design_Docs", "never called"]]);
+});
+
+test("redaction replaces server names in the MCP table", () => {
+  const names = run([mcpSession()], { redact: true }).byMcpServer.map((r) => r.name);
+  assert.equal(names.length, 3);
+  for (const name of names) assert.match(name, /^server \d+$/);
+});
+
+test("a resumed session's copied responses are not counted a second time", () => {
+  // The first file has the request and its response; the second holds a copy
+  // of the response only, still pointing at that request.
+  const original = () => {
+    const s = new Session().shape("shape", [{ name: "Bash", description: "b".repeat(100) }], ["system"]);
+    return s.request("r1", { tail: [s.blob(text("hi"))] }).assistant("r1", { write1h: 1000, output: 100 });
+  };
+  const copy = () => new Session().assistant("r1", { write1h: 1000, output: 100 });
+  for (const order of [[original(), copy()], [copy(), original()]]) {
+    const summary = run(order);
+    assert.equal(summary.requests, 1);
+    assert.equal(summary.unattributedMessages, 0);
+    near(summary.totalWeighted, (1000 * 8 + 100 * 20) * M, "counted once");
+  }
 });

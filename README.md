@@ -13,6 +13,9 @@ estimates what each part of the context cost: tool schemas, system prompt, MCP
 servers, tool results, history, output. Then it ranks what to fix, such as
 cache rebuilds after idle gaps.
 
+It also lists every connected MCP server with what it cost to keep connected
+and to use, and marks the ones you never call.
+
 - Local: no network calls, no LLM calls, no dependencies.
 - One readable file: [quotopsy.mjs](quotopsy.mjs).
 - Every figure is an estimate, and labelled as one.
