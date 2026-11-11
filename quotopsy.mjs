@@ -526,7 +526,8 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
 const noColor = globalThis.Deno ? globalThis.Deno.noColor : "NO_COLOR" in process.env;
 const paint = (stream) => (code, text) => (stream.isTTY && !noColor ? `\x1b[${code}m${text}\x1b[0m` : text);
 const out = paint(process.stdout), err = paint(process.stderr);
-const BOLD = 1, DIM = 2, CYAN = 36, YELLOW = 33, GREEN = 32;
+// Same accents as quotopsy.com: green for the brand and bars, amber for costs.
+const BOLD = 1, DIM = 2, YELLOW = 33, GREEN = 32;
 const BANNER = ["┌─┐ ┬ ┬┌─┐┌┬┐┌─┐┌─┐┌─┐┬ ┬", "│─┼┐│ ││ │ │ │ │├─┘└─┐└┬┘", "└─┘└└─┘└─┘ ┴ └─┘┴  └─┘ ┴ "];
 const bar = (share, width = 20) => "█".repeat(Math.round(share * width)).padEnd(width, "░");
 const num = (n) => Math.round(n).toLocaleString("en-US");
@@ -574,7 +575,7 @@ function printReport(summary, redact) {
   const table = summary.categories.filter((r) => !small.includes(r));
   if (small.length) table.push({ name: `${small.length} other MCP servers`, share: small.reduce((n, r) => n + r.share, 0), weighted: small.reduce((n, r) => n + r.weighted, 0), subs: [] });
   for (const r of table) {
-    console.log(`  ${title(r.name).slice(0, 30).padEnd(30)}  ${out(CYAN, bar(r.share))}  ${pct(r.share).padStart(6)}  ${usd(r.weighted).padStart(10)}`);
+    console.log(`  ${title(r.name).slice(0, 30).padEnd(30)}  ${out(GREEN, bar(r.share))}  ${pct(r.share).padStart(6)}  ${usd(r.weighted).padStart(10)}`);
     if (r.share < 0.05 || r.subs.length < 2) continue;
     for (const sub of r.subs.slice(0, 3)) {
       console.log(out(DIM, `      ${pct(sub.share).padStart(6)}  ${sub.name}${sub.calls != null ? ` (${num(sub.calls)} calls)` : ""}`));
@@ -617,11 +618,11 @@ function main() {
     if (!process.stderr.isTTY) return;
     if (!bannerShown) {
       bannerShown = true;
-      process.stderr.write(`\n${BANNER.map((l) => "  " + err(CYAN, l)).join("\n")}\n  ${err(DIM, "where did your Claude Code usage go?")}\n\n`);
+      process.stderr.write(`\n${BANNER.map((l) => "  " + err(GREEN, l)).join("\n")}\n  ${err(DIM, "where did your Claude Code usage go?")}\n\n`);
     }
     if (Date.now() - lastDraw < 60 && done < total) return;
     lastDraw = Date.now();
-    process.stderr.write(`\r  Reading sessions  ${err(CYAN, bar(done / total, 24))}  ${done}/${total}`);
+    process.stderr.write(`\r  Reading sessions  ${err(GREEN, bar(done / total, 24))}  ${done}/${total}`);
   };
 
   let summary;
