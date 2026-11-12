@@ -657,6 +657,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       + (redact ? "Names of MCP servers, MCP tools and custom subagents, and prompt section headings, are replaced with placeholders."
         : "Includes names of MCP servers, tools and custom subagents, and prompt section headings (lines that start with #); rerun with --redact to replace them."),
     redacted: redact,
+    version: VERSION,
     unit: "API-equivalent US dollars at published prices (hypothesis: limits may weight usage differently)",
     prices: PRICES, assumedPricing: Object.fromEntries(assumedPricing),
     since: since === null ? null : new Date(since).toISOString(), until: until === null ? null : new Date(until).toISOString(),

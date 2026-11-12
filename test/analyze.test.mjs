@@ -694,4 +694,5 @@ test("--doctor prints counts and versions, and no names or text", () => {
   assert.match(result.stdout, /health: +\S/);
   for (const private_ of ["github", "linear", "Design", "SECRET", "find it", tmpdir()]) assert.ok(!result.stdout.includes(private_), private_);
   assert.equal(spawnSync(process.execPath, [cli, "--version"], { encoding: "utf8" }).stdout.trim(), VERSION);
+  assert.equal(analyze(mkdtempSync(join(tmpdir(), "quotopsy-"))).version, VERSION);
 });
