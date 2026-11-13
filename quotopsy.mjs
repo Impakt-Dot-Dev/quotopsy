@@ -97,7 +97,7 @@ function splitUsage(u) {
 // `since` and `until` (milliseconds) limit the summary to usage from `since`
 // up to, not including, `until`. Earlier requests are still read, because
 // later ones are logged as changes to them.
-export function analyze(root, { redact = false, debug: debugOn = false, onProgress = () => {}, since = null, until = null } = {}) {
+export function analyze(root, { redact = false, debug: debugOn = false, onProgress = () => {}, since = null, until = null, placeholders = { names: new Map(), counts: new Map() } } = {}) {
   const filtered = since !== null || until !== null;
   const inRange = (ts) => {
     if (!filtered) return true;
@@ -125,7 +125,8 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
 
   const mcpServers = new Set(); // servers the log says injected instructions
   // Same name -> same placeholder, numbered per kind in order of appearance.
-  const aliases = new Map(), aliasCounts = new Map();
+  // Passing `placeholders` in keeps them the same across two calls.
+  const aliases = placeholders.names, aliasCounts = placeholders.counts;
   const PUBLIC_HEADINGS = new Set(["Environment", "Environment update"]); // written by Claude Code itself
   function alias(kind, name) {
     if (!redact || PUBLIC_HEADINGS.has(name)) return name;
@@ -891,21 +892,27 @@ export function compare(before, after) {
 function printCompare(result, splitDay) {
   const { before, after } = result;
   const cols = (label, x, y, change = "") => `  ${label.padEnd(30)}${x.padStart(15)}${y.padStart(16)}${change.padStart(11)}`;
-  const span = (side) => (side.requests ? `${day(side.from).slice(5)} to ${day(side.to).slice(5)}` : "none");
-  const points = (x, y) => { const d = (y - x) * 100; return `${d > 0 ? "+" : d < 0 ? "−" : ""}${Math.abs(d).toFixed(1)} pts`; };
+  // Rounded first, so a difference too small to show does not get a sign.
+  const signed = (value, unit) => { const text = Math.abs(value).toFixed(1); return `${Number(text) === 0 ? "" : value > 0 ? "+" : "−"}${text}${unit}`; };
+  // An empty side has no figures, and nothing to measure a change against.
+  const both = before.requests && after.requests;
+  const cell = (side, text) => (side.requests ? text : "–");
+  const row = (label, f, change) => console.log(cols(label, cell(before, f(before)), cell(after, f(after)), both && change ? change() : ""));
+  const cents = (n) => "$" + n.toFixed(3);
   const left = `BEFORE AND AFTER ${day(new Date(splitDay).toISOString())}`;
   console.log(`  ${out(BOLD, left.padEnd(30))}${out(DIM, cols("", "before", "after", "change").slice(32))}`);
   console.log("  " + out(DIM, "─".repeat(WIDTH)));
-  console.log(cols("Days with usage", span(before), span(after)));
-  console.log(cols("Requests", num(before.requests), num(after.requests)));
-  const ratio = before.perRequest && after.requests ? after.perRequest / before.perRequest - 1 : null;
-  console.log(cols("Cost per request", usd(before.perRequest), usd(after.perRequest), ratio === null ? "" : `${ratio > 0 ? "+" : ratio < 0 ? "−" : ""}${Math.abs(ratio * 100).toFixed(1)}%`));
+  row("First day with usage", (s) => day(s.from));
+  row("Last day with usage", (s) => day(s.to));
+  row("Requests", (s) => num(s.requests));
+  row("Cost per request", (s) => cents(s.perRequest), () => signed((after.perRequest / before.perRequest - 1) * 100, "%"));
   console.log();
   console.log(out(BOLD, "  Share of cost"));
-  for (const name of Object.keys(before.shares)) console.log(cols(`  ${name}`, pct(before.shares[name]), pct(after.shares[name]), points(before.shares[name], after.shares[name])));
+  for (const name of Object.keys(before.shares)) row(`  ${name}`, (s) => pct(s.shares[name]), () => signed((after.shares[name] - before.shares[name]) * 100, " pts"));
   console.log();
   console.log(out(BOLD, "  Model mix"));
-  for (const m of result.models.slice(0, 6)) console.log(cols(`  ${m}`.slice(0, 30), pct(before.models[m] ?? 0), pct(after.models[m] ?? 0)));
+  for (const m of result.models.slice(0, 6)) row(`  ${m}`.slice(0, 30), (s) => pct(s.models[m] ?? 0));
+  if (result.models.length > 6) console.log(out(DIM, `    and ${result.models.length - 6} more`));
   console.log();
   const notes = [
     ...result.cautions,
@@ -978,8 +985,12 @@ function main() {
 
   let summary, after;
   try {
-    summary = analyze(root, { redact, debug, onProgress, ...period, ...(split ? { until: split.day } : {}) });
-    if (split) after = analyze(root, { redact, debug, ...period, since: split.next });
+    // With --compare, --since and --until still bound the outer ends: each
+    // side takes whichever cut is tighter. One set of placeholders serves
+    // both passes, so "server 3" is the same server on each side.
+    const placeholders = { names: new Map(), counts: new Map() };
+    summary = analyze(root, { redact, debug, onProgress, placeholders, ...period, ...(split ? { until: Math.min(period.until ?? Infinity, split.day) } : {}) });
+    if (split) after = analyze(root, { redact, debug, placeholders, ...period, since: Math.max(period.since ?? -Infinity, split.next) });
   } catch (e) {
     if (e?.code !== "ENOENT" && e?.code !== "ENOTDIR") throw e;
   }
@@ -988,13 +999,17 @@ function main() {
     process.exit(1);
   }
   if (process.stderr.isTTY) {
-    process.stderr.write(`\r\x1b[2K  ${err(GREEN, "✓")} Read ${num(summary.filesScanned)} sessions and ${num(summary.requests + summary.unattributedMessages + (after ? after.requests + after.unattributedMessages : 0))} requests in ${((Date.now() - started) / 1000).toFixed(1)}s, on this machine only\n\n`);
+    process.stderr.write(`\r\x1b[2K  ${err(GREEN, "✓")} Read ${num(after ? summary.filesScanned : summary.files)} sessions and ${num(summary.requests + summary.unattributedMessages + (after ? after.requests + after.unattributedMessages : 0))} requests in ${((Date.now() - started) / 1000).toFixed(1)}s, on this machine only\n\n`);
   }
 
   if (split) {
     const result = compare(summary, after);
-    if (asJson) console.log(JSON.stringify({ comparison: { day: new Date(split.day).toISOString(), ...result }, before: summary, after }, null, 2));
-    else printCompare(result, split.day);
+    if (asJson) {
+      console.log(JSON.stringify({ comparison: { day: new Date(split.day).toISOString(), ...result }, before: summary, after }, null, 2));
+      if (process.stderr.isTTY && !process.stdout.isTTY) process.stderr.write(`  Comparison written${redact ? ", with names replaced by placeholders" : ""}. Have a look before you share it.\n\n`);
+    } else if (!result.before.requests && !result.after.requests) {
+      console.log("  No usage before or after that day.");
+    } else printCompare(result, split.day);
   } else if (doctor) {
     printDoctor(summary, Date.now() - started);
     if (process.stderr.isTTY) process.stderr.write("\n  Nothing above names a server, a tool, a file or any text. Paste it into an issue:\n  https://github.com/Impakt-Dot-Dev/quotopsy/issues\n\n");

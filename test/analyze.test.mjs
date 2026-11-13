@@ -746,5 +746,30 @@ test("--compare leaves its own day out and prints both sides", () => {
   assert.match(text, /BEFORE AND AFTER 2026-11-03 +before +after +change/);
   assert.match(text, /Requests +2 +2/);
   assert.match(text, /Only 2 requests before/);
+  assert.match(text, /First day with usage +2026-11-01 +2026-11-04/);
   assert.equal(cliRun("--compare=soon").status, 1);
+  // A --since or --until on the far side of the day still wins.
+  const late = JSON.parse(cliRun("--compare=2026-11-02", "--since=2026-11-04", "--json").stdout).comparison;
+  assert.equal(late.after.requests, 2);
+  assert.equal(late.before.requests, 0);
+  assert.equal(JSON.parse(cliRun("--compare=2026-11-04", "--until=2026-11-01", "--json").stdout).comparison.before.requests, 1);
+  // An empty side shows no figures and no change; two empty sides say so.
+  const oneSided = cliRun("--compare=2026-11-02", "--since=2026-11-04").stdout;
+  assert.match(oneSided, /Requests +– +2\s/);
+  assert.match(oneSided, /Thinking +– +0\.0%\s*\n/);
+  assert.match(cliRun("--compare=2027-01-01", "--since=2026-12-01").stdout, /No usage before or after that day/);
+  // Identical sides: no sign on a zero change.
+  assert.match(cliRun("--compare=2026-11-03").stdout, /Cost per request +\$0\.\d{3} +\$0\.\d{3} +0\.0%/);
+  assert.equal(cliRun("--compare=2026-11-03", "--doctor").stdout.includes("BEFORE AND AFTER"), false);
+});
+
+test("--compare with --redact gives a name the same placeholder on both sides", () => {
+  const at = (iso) => (Date.parse(iso) - T0) / 60000;
+  const s = new Session();
+  s.assistant(null, { fresh: 1000, output: 100 }, { minute: at("2026-11-01T12:00:00Z"), model: "house-model-a" });
+  s.assistant(null, { fresh: 1000, output: 100 }, { minute: at("2026-11-05T12:00:00Z"), model: "house-model-b" });
+  const root = logsFolder([s]), split = Date.parse("2026-11-03T00:00:00Z"), placeholders = { names: new Map(), counts: new Map() };
+  const before = analyze(root, { redact: true, until: split, placeholders }), after = analyze(root, { redact: true, since: split, placeholders });
+  assert.deepEqual([before.byModel[0].name, after.byModel[0].name], ["model 1", "model 2"]);
+  assert.equal(compare(before, after).mixShift, 1);
 });
