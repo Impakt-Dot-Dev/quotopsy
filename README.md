@@ -39,12 +39,18 @@ Days are read in your local time zone.
 
 ## Did a change help?
 
-Compare the period before it with the period after:
+Note the day you made the change. Then compare the period before it with the
+period after, leaving that day out:
 
 ```bash
 npx quotopsy --until=2026-11-10
-npx quotopsy --since=2026-11-11
+npx quotopsy --since=2026-11-12
 ```
+
+- Compare the percentages under WHAT TO FIX, not the dollar totals. The two
+  periods rarely hold the same amount of work.
+- Give it about a week. One long session can move a share by several points.
+- A change to your settings only reaches sessions started after it.
 
 ## Check it yourself
 
