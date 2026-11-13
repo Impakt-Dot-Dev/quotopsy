@@ -29,6 +29,7 @@ Needs Node 20 or newer.
 | `[logs-dir]` | Logs to read. Defaults to `~/.claude/projects`. |
 | `--since=DAY` | Only usage from that day on: `YYYY-MM-DD`, or days back such as `7d`. |
 | `--until=DAY` | Only usage up to the end of that day. |
+| `--compare=DAY` | Compare usage before that day with usage after it. |
 | `--json` | Print the summary as JSON. |
 | `--redact` | Replace MCP server names, MCP tool names and prompt headings with placeholders. |
 | `--debug` | With `--json`, add structure-only diagnostics. No message text. |
@@ -39,21 +40,26 @@ Days are read in your local time zone.
 
 ## Did a change help?
 
-Note the day you made the change. Then compare the period before it with the
-period after, leaving that day out:
+Give the day you made the change:
 
 ```bash
-npx quotopsy --until=2026-11-10
-npx quotopsy --since=2026-11-12
+npx quotopsy --compare=2026-11-12
 ```
 
-- Compare the percentages under WHAT TO FIX, not the dollar totals. A
-  smaller total can simply mean less work.
-- Shares move with the kind of work and the model too. The comparison reads
-  best when both periods held similar tasks on the same model: check BY MODEL
-  in both reports before drawing a conclusion.
+It sets the period before that day beside the period after it, leaving the
+day itself out: cost per request, the share of cost for the things a change
+can move (thinking, tool results, cache rebuilds, MCP servers), and the model
+mix on each side.
+
+- Read the shares, not the totals. A smaller total can simply mean less work.
+- Shares move with the kind of work and the model too. The report warns when
+  the model mix differs between the two periods, or when one of them is too
+  small to say much.
 - Give it about a week. One long session can move a share by several points.
 - A change to your settings only reaches sessions started after it.
+
+`--since` and `--until` still bound the outer ends, and you can run them on
+their own for a full report of either period.
 
 ## Check it yourself
 

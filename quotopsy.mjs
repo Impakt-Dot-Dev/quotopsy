@@ -37,7 +37,7 @@ const PRICES = {
 // the same family, and reported so the reader knows.
 const FAMILY = { fable: "claude-fable-5-2", mythos: "claude-mythos-5-2", opus: "claude-opus-5-5", sonnet: "claude-sonnet-5-5", haiku: "claude-haiku-5-5" };
 // Kept equal to "version" in package.json; a test checks it.
-export const VERSION = "0.4.2";
+export const VERSION = "0.5.0";
 const MCP = "MCP server: ", INSTRUCTIONS = "MCP instructions: ";
 const isMcp = (name) => name.startsWith("mcp__");
 const count = (map, key) => map.set(key, (map.get(key) ?? 0) + 1);
@@ -740,14 +740,15 @@ const BANNER = ["▀▄  █▀█  █ █ █▀█ ▀█▀ █▀█ █▀
 const bar = (share, width = 20) => "█".repeat(Math.round(share * width)).padEnd(width, "░");
 const num = (n) => Math.round(n).toLocaleString("en-US");
 
+const pct = (x) => (x * 100).toFixed(1) + "%";
+const usd = (n) => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+// Dates in the reader's own time zone: the logs are in UTC, where an
+// evening session already belongs to tomorrow.
+const day = (iso) => { const d = new Date(iso); return iso ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}` : "?"; };
+const WIDTH = 72;
+
 function printReport(summary, redact) {
-  const pct = (x) => (x * 100).toFixed(1) + "%";
-  const usd = (n) => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const title = (t) => t[0].toUpperCase() + t.slice(1);
-  // Dates in the reader's own time zone: the logs are in UTC, where an
-  // evening session already belongs to tomorrow.
-  const day = (iso) => { const d = new Date(iso); return iso ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}` : "?"; };
-  const WIDTH = 72;
   // Word-wrap to the report width, with a first-line prefix and a hanging indent.
   const wrap = (text, first, hang, style = (t) => t) => {
     let line = first;
@@ -852,6 +853,76 @@ function printReport(summary, redact) {
   console.log();
 }
 
+// The figures a change to your setup is meant to move, and the model mix,
+// which moves them too.
+function comparable(summary) {
+  const total = summary.totalWeighted, requests = summary.requests + summary.unattributedMessages;
+  const sub = (category, name) => summary.categories.find((r) => r.name === category)?.subs.find((s) => s.name === name)?.share ?? 0;
+  return {
+    from: summary.from, to: summary.to, requests, cost: total, perRequest: requests ? total / requests : 0,
+    shares: {
+      "Thinking": sub("output", "thinking") + sub("assistant history", "thinking"),
+      "Tool results kept in context": summary.categories.find((r) => r.name === "tool results")?.share ?? 0,
+      "Cache rebuilds": total ? summary.cacheRebuilds.reduce((n, r) => n + r.wasted, 0) / total : 0,
+      "MCP servers kept connected": total ? summary.byMcpServer.reduce((n, r) => n + r.carried, 0) / total : 0,
+    },
+    models: Object.fromEntries(summary.byModel.map((r) => [r.name, r.share])),
+  };
+}
+
+// Below this many requests a period says little: one session can dominate it.
+const FEW_REQUESTS = 100;
+// Sets two periods side by side and says when the comparison is weak: too
+// little usage on one side, or a different mix of models.
+export function compare(before, after) {
+  const a = comparable(before), b = comparable(after);
+  const models = [...new Set([...Object.keys(a.models), ...Object.keys(b.models)])].sort((x, y) => (b.models[y] ?? 0) + (a.models[y] ?? 0) - (b.models[x] ?? 0) - (a.models[x] ?? 0));
+  // Share of cost that sits on a different model in the other period.
+  const mixShift = models.reduce((n, m) => n + Math.abs((a.models[m] ?? 0) - (b.models[m] ?? 0)), 0) / 2;
+  const cautions = [];
+  for (const [name, side] of [["before", a], ["after", b]]) {
+    if (!side.requests) cautions.push(`No usage ${name} that day, so there is nothing to compare.`);
+    else if (side.requests < FEW_REQUESTS) cautions.push(`Only ${side.requests} requests ${name}: too few to read much into. One long session can move a share by several points.`);
+  }
+  if (a.requests && b.requests && mixShift > 0.15) cautions.push(`The model mix differs: ${Math.round(mixShift * 100)}% of the cost sits on a different model. Cost per request is not comparable across models, and shares move with the model too.`);
+  return { before: a, after: b, models, mixShift, cautions };
+}
+
+function printCompare(result, splitDay) {
+  const { before, after } = result;
+  const cols = (label, x, y, change = "") => `  ${label.padEnd(30)}${x.padStart(15)}${y.padStart(16)}${change.padStart(11)}`;
+  const span = (side) => (side.requests ? `${day(side.from).slice(5)} to ${day(side.to).slice(5)}` : "none");
+  const points = (x, y) => { const d = (y - x) * 100; return `${d > 0 ? "+" : d < 0 ? "−" : ""}${Math.abs(d).toFixed(1)} pts`; };
+  const left = `BEFORE AND AFTER ${day(new Date(splitDay).toISOString())}`;
+  console.log(`  ${out(BOLD, left.padEnd(30))}${out(DIM, cols("", "before", "after", "change").slice(32))}`);
+  console.log("  " + out(DIM, "─".repeat(WIDTH)));
+  console.log(cols("Days with usage", span(before), span(after)));
+  console.log(cols("Requests", num(before.requests), num(after.requests)));
+  const ratio = before.perRequest && after.requests ? after.perRequest / before.perRequest - 1 : null;
+  console.log(cols("Cost per request", usd(before.perRequest), usd(after.perRequest), ratio === null ? "" : `${ratio > 0 ? "+" : ratio < 0 ? "−" : ""}${Math.abs(ratio * 100).toFixed(1)}%`));
+  console.log();
+  console.log(out(BOLD, "  Share of cost"));
+  for (const name of Object.keys(before.shares)) console.log(cols(`  ${name}`, pct(before.shares[name]), pct(after.shares[name]), points(before.shares[name], after.shares[name])));
+  console.log();
+  console.log(out(BOLD, "  Model mix"));
+  for (const m of result.models.slice(0, 6)) console.log(cols(`  ${m}`.slice(0, 30), pct(before.models[m] ?? 0), pct(after.models[m] ?? 0)));
+  console.log();
+  const notes = [
+    ...result.cautions,
+    "The day itself is left out of both sides. Shares say how the split changed, not whether total usage fell: a smaller total can simply mean less work.",
+    "Every figure is an estimate. The comparison reads best when both periods held similar tasks on the same model.",
+  ];
+  for (const note of notes) {
+    let line = "  · ";
+    for (const word of note.split(" ")) {
+      if (line.length + word.length + 1 > WIDTH + 2) { console.log(out(result.cautions.includes(note) ? YELLOW : DIM, line)); line = "    " + word; }
+      else line += (line.length === 4 ? "" : " ") + word;
+    }
+    console.log(out(result.cautions.includes(note) ? YELLOW : DIM, line));
+  }
+  console.log();
+}
+
 // A day given as YYYY-MM-DD, or as a number of days back from today ("7d"),
 // read in the local time zone. Returns the start of that day plus `addDays`.
 export function parseDay(text, addDays = 0, now = new Date()) {
@@ -870,20 +941,26 @@ function main() {
   // --doctor always redacts: its output is meant to be pasted in public.
   const doctor = args.includes("--doctor");
   const asJson = args.includes("--json"), redact = doctor || args.includes("--redact"), debug = doctor || args.includes("--debug");
-  // --since=DAY and --until=DAY, also accepted as two words.
+  // --since=DAY, --until=DAY and --compare=DAY, also accepted as two words.
   const period = {};
-  for (const name of ["since", "until"]) {
+  let split = null;
+  for (const name of ["since", "until", "compare"]) {
     const i = args.findIndex((a) => a === `--${name}` || a.startsWith(`--${name}=`));
     if (i < 0) continue;
     const [arg, next] = args.splice(i, args[i].includes("=") ? 1 : 2);
     const value = arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : next ?? "";
     // --until names the last day to include, so the cut is the start of the next one.
-    period[name] = parseDay(value, name === "until" ? 1 : 0);
-    if (period[name] === null) {
+    const at = parseDay(value, name === "until" ? 1 : 0);
+    if (at === null) {
       console.error(`--${name} needs a day, as YYYY-MM-DD or a number of days back such as 7d. Got: ${value || "nothing"}`);
       process.exit(1);
     }
+    // --compare leaves its own day out: before ends as it starts, after
+    // begins the next morning.
+    if (name === "compare") split = { day: at, next: parseDay(value, 1) };
+    else period[name] = at;
   }
+  if (doctor) split = null;
   const root = args.find((a) => !a.startsWith("--")) ?? join(homedir(), ".claude", "projects");
 
   const started = Date.now();
@@ -899,8 +976,11 @@ function main() {
     process.stderr.write(`\r  Reading sessions  ${err(GREEN, bar(done / total, 24))}  ${done}/${total}`);
   };
 
-  let summary;
-  try { summary = analyze(root, { redact, debug, onProgress, ...period }); } catch (e) {
+  let summary, after;
+  try {
+    summary = analyze(root, { redact, debug, onProgress, ...period, ...(split ? { until: split.day } : {}) });
+    if (split) after = analyze(root, { redact, debug, ...period, since: split.next });
+  } catch (e) {
     if (e?.code !== "ENOENT" && e?.code !== "ENOTDIR") throw e;
   }
   if (!summary?.filesScanned) {
@@ -908,10 +988,14 @@ function main() {
     process.exit(1);
   }
   if (process.stderr.isTTY) {
-    process.stderr.write(`\r\x1b[2K  ${err(GREEN, "✓")} Read ${num(summary.files)} sessions and ${num(summary.requests + summary.unattributedMessages)} requests in ${((Date.now() - started) / 1000).toFixed(1)}s, on this machine only\n\n`);
+    process.stderr.write(`\r\x1b[2K  ${err(GREEN, "✓")} Read ${num(summary.filesScanned)} sessions and ${num(summary.requests + summary.unattributedMessages + (after ? after.requests + after.unattributedMessages : 0))} requests in ${((Date.now() - started) / 1000).toFixed(1)}s, on this machine only\n\n`);
   }
 
-  if (doctor) {
+  if (split) {
+    const result = compare(summary, after);
+    if (asJson) console.log(JSON.stringify({ comparison: { day: new Date(split.day).toISOString(), ...result }, before: summary, after }, null, 2));
+    else printCompare(result, split.day);
+  } else if (doctor) {
     printDoctor(summary, Date.now() - started);
     if (process.stderr.isTTY) process.stderr.write("\n  Nothing above names a server, a tool, a file or any text. Paste it into an issue:\n  https://github.com/Impakt-Dot-Dev/quotopsy/issues\n\n");
   } else if (asJson) {

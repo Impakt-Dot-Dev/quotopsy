@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
-import { analyze, hashMessage, health, parseDay, VERSION } from "../quotopsy.mjs";
+import { analyze, compare, hashMessage, health, parseDay, VERSION } from "../quotopsy.mjs";
 
 const OPUS = "claude-opus-5-5"; // $4 in, $0.20 cache read, $8 one-hour write, $20 out, per million tokens
 const M = 1e-6;
@@ -695,4 +695,56 @@ test("--doctor prints counts and versions, and no names or text", () => {
   for (const private_ of ["github", "linear", "Design", "SECRET", "find it", tmpdir()]) assert.ok(!result.stdout.includes(private_), private_);
   assert.equal(spawnSync(process.execPath, [cli, "--version"], { encoding: "utf8" }).stdout.trim(), VERSION);
   assert.equal(analyze(mkdtempSync(join(tmpdir(), "quotopsy-"))).version, VERSION);
+});
+
+// A summary with only the fields compare() reads.
+function period({ requests, cost, thinking = 0, results = 0, wasted = 0, models = { [OPUS]: 1 } }) {
+  return {
+    from: "2026-01-01T10:00:00.000Z", to: "2026-01-05T10:00:00.000Z", requests, unattributedMessages: 0, totalWeighted: cost,
+    categories: [{ name: "output", share: thinking, subs: [{ name: "thinking", share: thinking }] }, { name: "tool results", share: results, subs: [] }],
+    cacheRebuilds: wasted ? [{ wasted }] : [], byMcpServer: [],
+    byModel: Object.entries(models).map(([name, share]) => ({ name, share })),
+  };
+}
+
+test("compare sets two periods side by side without a caution when they are alike", () => {
+  const result = compare(period({ requests: 400, cost: 80, thinking: 0.2, results: 0.15, wasted: 8 }), period({ requests: 200, cost: 30, thinking: 0.12, results: 0.1 }));
+  assert.equal(result.before.perRequest, 0.2);
+  assert.equal(result.after.perRequest, 0.15);
+  assert.equal(result.before.shares["Thinking"], 0.2);
+  assert.equal(result.after.shares["Tool results kept in context"], 0.1);
+  assert.equal(result.before.shares["Cache rebuilds"], 0.1);
+  assert.equal(result.mixShift, 0);
+  assert.deepEqual(result.cautions, []);
+});
+
+test("compare warns when a period is small, empty, or on a different mix of models", () => {
+  const big = period({ requests: 400, cost: 80 });
+  assert.match(compare(big, period({ requests: 12, cost: 3 })).cautions.join(" "), /Only 12 requests after/);
+  assert.match(compare(period({ requests: 0, cost: 0, models: {} }), big).cautions.join(" "), /No usage before/);
+  const moved = compare(big, period({ requests: 300, cost: 20, models: { [OPUS]: 0.4, "claude-haiku-5-5": 0.6 } }));
+  assert.equal(moved.mixShift, 0.6);
+  assert.match(moved.cautions.join(" "), /60% of the cost sits on a different model/);
+  assert.deepEqual(moved.models, [OPUS, "claude-haiku-5-5"]);
+  // A small shift is normal and not worth a warning.
+  assert.deepEqual(compare(big, period({ requests: 300, cost: 20, models: { [OPUS]: 0.9, "claude-haiku-5-5": 0.1 } })).cautions, []);
+});
+
+test("--compare leaves its own day out and prints both sides", () => {
+  const cli = fileURLToPath(new URL("../quotopsy.mjs", import.meta.url));
+  const at = (iso) => (Date.parse(iso) - T0) / 60000;
+  const s = new Session();
+  for (const iso of ["2026-11-01T12:00:00Z", "2026-11-02T09:00:00Z", "2026-11-03T12:00:00Z", "2026-11-04T12:00:00Z", "2026-11-05T12:00:00Z"]) s.assistant(null, { fresh: 1000, output: 100 }, { minute: at(iso) });
+  const cliRun = (...args) => spawnSync(process.execPath, [cli, logsFolder([s]), ...args], { encoding: "utf8", env: { ...process.env, TZ: "UTC", NO_COLOR: "1" } });
+  const result = JSON.parse(cliRun("--compare=2026-11-03", "--json").stdout);
+  assert.equal(result.comparison.before.requests, 2);
+  assert.equal(result.comparison.after.requests, 2); // the message on the 3rd is on neither side
+  assert.equal(result.before.unattributedMessages, 2);
+  // --since and --until still bound the outer ends.
+  assert.equal(JSON.parse(cliRun("--compare", "2026-11-03", "--since=2026-11-02", "--until=2026-11-04", "--json").stdout).comparison.after.requests, 1);
+  const text = cliRun("--compare=2026-11-03").stdout;
+  assert.match(text, /BEFORE AND AFTER 2026-11-03 +before +after +change/);
+  assert.match(text, /Requests +2 +2/);
+  assert.match(text, /Only 2 requests before/);
+  assert.equal(cliRun("--compare=soon").status, 1);
 });
