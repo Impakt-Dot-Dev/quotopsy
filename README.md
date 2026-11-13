@@ -47,8 +47,11 @@ npx quotopsy --until=2026-11-10
 npx quotopsy --since=2026-11-12
 ```
 
-- Compare the percentages under WHAT TO FIX, not the dollar totals. The two
-  periods rarely hold the same amount of work.
+- Compare the percentages under WHAT TO FIX, not the dollar totals. A
+  smaller total can simply mean less work.
+- Shares move with the kind of work and the model too. The comparison reads
+  best when both periods held similar tasks on the same model: check BY MODEL
+  in both reports before drawing a conclusion.
 - Give it about a week. One long session can move a share by several points.
 - A change to your settings only reaches sessions started after it.
 
