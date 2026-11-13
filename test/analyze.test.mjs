@@ -772,4 +772,9 @@ test("--compare with --redact gives a name the same placeholder on both sides", 
   const before = analyze(root, { redact: true, until: split, placeholders }), after = analyze(root, { redact: true, since: split, placeholders });
   assert.deepEqual([before.byModel[0].name, after.byModel[0].name], ["model 1", "model 2"]);
   assert.equal(compare(before, after).mixShift, 1);
+  // The command line shares them too.
+  const cli = fileURLToPath(new URL("../quotopsy.mjs", import.meta.url));
+  const result = JSON.parse(spawnSync(process.execPath, [cli, root, "--compare=2026-11-03", "--redact", "--json"], { encoding: "utf8", env: { ...process.env, TZ: "UTC" } }).stdout);
+  assert.deepEqual(result.comparison.models.sort(), ["model 1", "model 2"]);
+  assert.equal(result.comparison.mixShift, 1);
 });

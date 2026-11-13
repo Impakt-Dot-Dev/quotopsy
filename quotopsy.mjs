@@ -898,14 +898,14 @@ function printCompare(result, splitDay) {
   const both = before.requests && after.requests;
   const cell = (side, text) => (side.requests ? text : "–");
   const row = (label, f, change) => console.log(cols(label, cell(before, f(before)), cell(after, f(after)), both && change ? change() : ""));
-  const cents = (n) => "$" + n.toFixed(3);
+  const fine = (n) => "$" + n.toFixed(3); // a request costs cents, so three decimals
   const left = `BEFORE AND AFTER ${day(new Date(splitDay).toISOString())}`;
   console.log(`  ${out(BOLD, left.padEnd(30))}${out(DIM, cols("", "before", "after", "change").slice(32))}`);
   console.log("  " + out(DIM, "─".repeat(WIDTH)));
   row("First day with usage", (s) => day(s.from));
   row("Last day with usage", (s) => day(s.to));
   row("Requests", (s) => num(s.requests));
-  row("Cost per request", (s) => cents(s.perRequest), () => signed((after.perRequest / before.perRequest - 1) * 100, "%"));
+  row("Cost per request", (s) => fine(s.perRequest), () => (before.perRequest ? signed((after.perRequest / before.perRequest - 1) * 100, "%") : ""));
   console.log();
   console.log(out(BOLD, "  Share of cost"));
   for (const name of Object.keys(before.shares)) row(`  ${name}`, (s) => pct(s.shares[name]), () => signed((after.shares[name] - before.shares[name]) * 100, " pts"));
