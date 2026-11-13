@@ -807,6 +807,7 @@ test("an unknown option stops the run, and --help prints the options", () => {
   assert.equal(typo.stdout, "");
   assert.match(typo.stderr, /Unknown option: --redcat/);
   assert.equal(cliRun(root, "-x").status, 1);
+  assert.match(cliRun(root, "another-folder").stderr, /Unexpected extra argument: another-folder/);
   for (const flag of ["--help", "-h"]) assert.match(cliRun(flag).stdout, /^Usage: npx quotopsy/);
   // The logs folder may come after the options.
   assert.equal(JSON.parse(cliRun("--json", root).stdout).unattributedMessages, 1);
@@ -848,4 +849,33 @@ test("the Haiku long-prompt rate applies when only the split cache-write fields 
   const s = new Session();
   s.add({ type: "assistant", timestamp: at(0), message: { id: "m1", model: "claude-haiku-5-5", role: "assistant", content: [{ type: "text", text: "ok" }], usage } });
   near(run([s]).totalWeighted, 200000 * 0.1 * 2 * 5 * M, "5x over 100,000 tokens");
+});
+
+test("odd values in a log do not lose a session or print as they are", () => {
+  const s = new Session().shape("shape", [], ["system"]);
+  const odd = s.blob({ role: "system", content: [{ type: "text", text: 42 }] });
+  const reply = s.blob({ role: "assistant", content: [{ type: "kind /Users/someone", text: "x".repeat(400) }] });
+  const result = s.blob({ role: "user", content: [{ type: "tool_result", tool_use_id: "never-seen", content: "rows ".repeat(100) }] });
+  s.request("r1", { tail: [s.blob(text("go")), odd, reply, result] }).assistant("r1", { fresh: 1000 });
+  s.request("r2", { base: "r1", keep: 4, tail: [s.blob(text("more"))], minute: 1 }).assistant("r2", { fresh: 5000 });
+  const root = logsFolder([s]);
+  const plain = analyze(root, { debug: true }), redacted = analyze(root, { redact: true, debug: true });
+  assert.equal(plain.filesFailed, 0);
+  assert.equal(plain.requests, 2);
+  near(plain.totalWeighted, 6000 * 4 * M, "both requests priced in full");
+  for (const summary of [plain, redacted]) assert.ok(!JSON.stringify(summary).includes("/Users/someone"));
+  // A result whose call is not in the log keeps its plain label under --redact.
+  assert.ok(JSON.stringify(redacted).includes("(unknown tool)"));
+});
+
+test("older public Claude model ids keep their names", () => {
+  const a = new Session().assistant(null, { fresh: 1000 }, { model: "claude-3-5-sonnet-20241022" });
+  const b = Object.assign(new Session(), { n: 5 }).assistant(null, { fresh: 1000 }, { model: "claude-3-opus-20240229" });
+  assert.deepEqual(Object.keys(run([a, b]).models).sort(), ["claude-3-5-sonnet-20241022", "claude-3-opus-20240229"]);
+});
+
+test("a request that wrote nothing keeps the five-minute lifetime it inherited", () => {
+  // Five-minute writes, then a request that only reads, then 10 idle minutes.
+  const summary = run([conversation({ minute: 1, usage: { read: 20000 } }, { minute: 11, usage: { read: 1000, write5m: 25000 } })].map((s) => { s.lines = s.lines.map((l) => l.replace('"ephemeral_1h_input_tokens":20000,"ephemeral_5m_input_tokens":0', '"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":20000')); return s; }));
+  assert.deepEqual(summary.cacheRebuilds.map((r) => r.cause), ["idle longer than the cache lifetime"]);
 });

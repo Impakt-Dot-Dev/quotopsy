@@ -35,6 +35,7 @@ Needs Node 20 or newer.
 | `--debug` | With `--json`, add structure-only diagnostics. No message text. |
 | `--doctor` | Print a short diagnostic to paste into an issue: versions, counts and sizes. No names, paths or text. |
 | `--version` | Print the version. |
+| `--help` | Print these options. |
 
 Days are read in your local time zone.
 

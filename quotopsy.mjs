@@ -62,7 +62,7 @@ const typeName = (v) => (/^[A-Za-z0-9_-]{1,40}$/.test(String(v)) ? String(v) : "
 const versionName = (v) => (v == null ? "unknown" : /^\d+(\.\d+){1,3}[A-Za-z0-9.+-]{0,20}$/.test(String(v)) ? String(v) : "(other)");
 // Tools that ship with Claude Code. Any other tool name may describe a
 // private system, so --redact replaces it.
-const BUILT_IN = new Set(["Agent", "Artifact", "AskUserQuestion", "Bash", "BashOutput", "CronCreate", "CronDelete", "CronList", "DeferredToolPlaceholder", "Edit", "EnterPlanMode", "EnterWorktree", "ExitPlanMode", "ExitWorktree", "Glob", "Grep", "KillShell", "ListAgents", "ListMcpResourcesTool", "LS", "Monitor", "MultiEdit", "NotebookEdit", "NotebookRead", "PushNotification", "Read", "ReadMcpResourceTool", "RemoteTrigger", "ReportFindings", "ScheduleWakeup", "SendFeedback", "SendMessage", "SendUserFile", "Skill", "SlashCommand", "Task", "TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TaskUpdate", "TodoRead", "TodoWrite", "ToolSearch", "WebFetch", "WebSearch", "Workflow", "Write", "advisor", "unknown"]);
+const BUILT_IN = new Set(["Agent", "Artifact", "AskUserQuestion", "Bash", "BashOutput", "CronCreate", "CronDelete", "CronList", "DeferredToolPlaceholder", "Edit", "EnterPlanMode", "EnterWorktree", "ExitPlanMode", "ExitWorktree", "Glob", "Grep", "KillShell", "ListAgents", "ListMcpResourcesTool", "LS", "Monitor", "MultiEdit", "NotebookEdit", "NotebookRead", "PushNotification", "Read", "ReadMcpResourceTool", "RemoteTrigger", "ReportFindings", "ScheduleWakeup", "SendFeedback", "SendMessage", "SendUserFile", "Skill", "SlashCommand", "Task", "TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TaskUpdate", "TodoRead", "TodoWrite", "ToolSearch", "WebFetch", "WebSearch", "Workflow", "Write", "advisor", "unknown", "(unknown tool)"]);
 
 // Base64 image and document payloads are not tokenized as text. ESTIMATE:
 // drop the payload and count each as roughly 1,500 tokens' worth of chars.
@@ -88,6 +88,9 @@ function thinkingChars(b) {
 
 // Blob hashes are SHA-256 of the message as compact JSON with sorted keys.
 const sorted = (v) => Array.isArray(v) ? v.map(sorted) : v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sorted(v[k])])) : v;
+// Minutes the cache lasts after a request: by what it wrote, or, when it
+// wrote nothing, what the request before it had.
+const lifetime = (u, prev) => (u.write1h ? 60 : u.write ? 5 : prev?.ttlMin ?? 60);
 export const hashMessage = (m) => createHash("sha256").update(JSON.stringify(sorted(m))).digest("hex");
 
 // The public model name inside a logged model id. Drops date suffixes and
@@ -117,9 +120,10 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     return (since === null || t >= since) && (until === null || t < until);
   };
   const assumedPricing = new Map(); // model -> model whose prices were used
-  // An id with no Claude model in it is shown only if it is short and plain:
-  // a cloud resource path can carry an account number.
-  const modelName = (model) => MODEL_ID.exec(model ?? "")?.[0] ?? (model ? alias("model", String(model), !/^[A-Za-z0-9._-]{1,40}$/.test(String(model)) || /\d{6}/.test(String(model))) : "unknown");
+  // An id with no current Claude model in it is shown only if it is short and
+  // plain: a cloud resource path can carry an account number. Older public
+  // ids such as claude-3-opus-20240229 carry a date and are shown.
+  const modelName = (model) => MODEL_ID.exec(model ?? "")?.[0] ?? (model ? alias("model", String(model), !/^[A-Za-z0-9._-]{1,40}$/.test(String(model)) || (/\d{6}/.test(String(model)) && !String(model).startsWith("claude-"))) : "unknown");
   function rates(model, usage = {}) {
     const id = modelName(model);
     let key = id in PRICES ? id : null;
@@ -196,7 +200,8 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
   // Prompt text -> segments by heading. A server's instructions, and its tool
   // names where the prompt lists them, are charged to that server as the
   // cost of keeping it connected.
-  function promptSegments(category, text) {
+  function promptSegments(category, given) {
+    const text = typeof given === "string" ? given : "";
     const names = new Map(); // server row -> characters spent naming its tools
     for (const [name] of text.matchAll(/mcp__[A-Za-z0-9_-]+?__[A-Za-z0-9_-]+/g)) names.set(toolGroup(name), (names.get(toolGroup(name)) ?? 0) + name.length + 1);
     const named = Math.min(text.length, [...names.values()].reduce((n, c) => n + c, 0));
@@ -214,7 +219,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     return blocks.flatMap((b) => {
       const chars = b.type === "thinking" ? thinkingChars(b) : blockChars(b);
       if (msg.role === "system") return promptSegments("injected system messages", b.text ?? "");
-      if (msg.role === "assistant") return [["assistant history", b.type, chars, b.type === "tool_use" ? [culpritOf(String(b.name ?? "unknown")), "calling"] : null]];
+      if (msg.role === "assistant") return [["assistant history", typeName(b.type), chars, b.type === "tool_use" ? [culpritOf(String(b.name ?? "unknown")), "calling"] : null]];
       if (b.type === "tool_result") {
         const name = toolNames.get(b.tool_use_id) ?? "(unknown tool)";
         return [["tool results", toolLabel(name), chars, [culpritOf(name), "results"]]];
@@ -363,8 +368,8 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
   // Content block types of a message, including those nested in tool results.
   function blockTypes(msg, into) {
     for (const b of Array.isArray(msg.content) ? msg.content.filter((b) => b && typeof b === "object") : [{ type: "text" }]) {
-      count(into, `${msg.role}:${b.type}`);
-      if (b.type === "tool_result" && Array.isArray(b.content)) for (const inner of b.content) count(into, `tool_result>${inner.type}`);
+      count(into, `${typeName(msg.role)}:${typeName(b.type)}`);
+      if (b.type === "tool_result" && Array.isArray(b.content)) for (const inner of b.content) count(into, `tool_result>${typeName(inner?.type)}`);
     }
   }
 
@@ -419,7 +424,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       if (!inRange(req.timestamp)) {
         // Outside the period: remember it only as what a later request extends.
         const u = splitUsage(res.usage);
-        answered.set(req.id, { prompt: u.fresh + u.write + u.read, ts: req.timestamp, model: res.model, shapeHash: req.shapeHash, ttlMin: u.write1h || !u.write ? 60 : 5 });
+        answered.set(req.id, { prompt: u.fresh + u.write + u.read, ts: req.timestamp, model: res.model, shapeHash: req.shapeHash, ttlMin: lifetime(u, answered.get(req.base) ?? lastOf.get(hashes[0])) });
         lastOf.set(hashes[0], answered.get(req.id));
         continue;
       }
@@ -530,7 +535,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
           : keep < baseLen ? "conversation edited"
           : req.shapeHash !== prev.shapeHash ? "tool list or system prompt changed"
           : "unknown";
-        rebuilds.push({ cause, tokens: lost, wasted: lost * (writeRate - w.read), at: req.timestamp, gapMin: Math.round(gapMin), version: req.version ?? "unknown" });
+        rebuilds.push({ cause, tokens: lost, wasted: lost * (writeRate - w.read), at: req.timestamp, gapMin: Math.round(gapMin), version: req.version ?? "unknown", source });
         if (debugOn && cause === "unknown" && debug.unknownRebuilds.length < DEBUG_CAP) {
           debug.unknownRebuilds.push({
             version: req.version, source, gapMin, previousPrompt: prev.prompt, usage: u, ttlMin: prev.ttlMin,
@@ -538,7 +543,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
           });
         }
       }
-      answered.set(req.id, { prompt, ts: req.timestamp, model: res.model, shapeHash: req.shapeHash, ttlMin: u.write1h || !u.write ? 60 : 5 });
+      answered.set(req.id, { prompt, ts: req.timestamp, model: res.model, shapeHash: req.shapeHash, ttlMin: lifetime(u, prev) });
       lastOf.set(hashes[0], answered.get(req.id));
     }
     pendingOrphans.push({ session, hasRequests: s.requests.length > 0, list: [...s.orphans.values()].map((o) => ({ ...o, calling: outputShares(s.turns.get(o.id)), signature: signatureChars(s.turns.get(o.id)) })) });
@@ -554,7 +559,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       if (!inRange(ts)) {
         // Outside the period: remember it only as what the next one follows.
         const u = splitUsage(usage);
-        lastOrphan.set(thread, { prompt: u.fresh + u.write + u.read, ts, ttlMin: u.write1h || !u.write ? 60 : 5 });
+        lastOrphan.set(thread, { prompt: u.fresh + u.write + u.read, ts, ttlMin: lifetime(u, lastOrphan.get(thread)) });
         continue;
       }
       session.active = true;
@@ -585,7 +590,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       if (prev && u.read < 0.8 * prev.prompt && lost > 5000 && gapMin > prev.ttlMin) {
         rebuilds.push({ cause: "idle longer than the cache lifetime", tokens: lost, wasted: lost * (writeCost / u.write - w.read), at: ts, gapMin: Math.round(gapMin), version: version ?? "unknown" });
       }
-      lastOrphan.set(thread, { prompt, ts, ttlMin: u.write1h || !u.write ? 60 : 5 });
+      lastOrphan.set(thread, { prompt, ts, ttlMin: lifetime(u, prev) });
     }
   }
 
@@ -998,10 +1003,11 @@ function main() {
   }
   if (doctor) split = null;
   const known = ["--json", "--redact", "--debug", "--doctor"];
-  const unknown = args.find((a) => a.startsWith("-") && !known.includes(a));
+  // More than one folder is as much a mistake as a mistyped option.
+  const unknown = args.find((a) => a.startsWith("-") && !known.includes(a)) ?? args.filter((a) => !a.startsWith("-"))[1];
   // A mistyped --redact must not print names: stop instead of carrying on.
   if (unknown) {
-    console.error(`Unknown option: ${unknown}\n\n${USAGE}`);
+    console.error(`${unknown.startsWith("-") ? "Unknown option" : "Unexpected extra argument"}: ${unknown}\n\n${USAGE}`);
     process.exit(1);
   }
   const root = args.find((a) => !a.startsWith("-")) ?? join(homedir(), ".claude", "projects");
