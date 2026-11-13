@@ -778,3 +778,74 @@ test("--compare with --redact gives a name the same placeholder on both sides", 
   assert.deepEqual(result.comparison.models.sort(), ["model 1", "model 2"]);
   assert.equal(result.comparison.mixShift, 1);
 });
+
+// A conversation whose third request drops history: `keep` 1 of 3 messages.
+function rewritten(usage) {
+  const s = new Session().shape("shape", [], ["system"]);
+  const u1 = s.blob(text("first")), a1 = s.blob({ role: "assistant", content: [{ type: "text", text: "reply" }] }), u2 = s.blob(text("second"));
+  s.request("r1", { tail: [u1] }).assistant("r1", { write1h: 100000 });
+  s.request("r2", { base: "r1", keep: 1, tail: [a1, u2], minute: 1 }).assistant("r2", { read: 100000, write1h: 10000 });
+  s.request("r3", { base: "r2", keep: 1, tail: [s.blob(text("summary"))], minute: 2 }).assistant("r3", usage);
+  return run([s]);
+}
+
+test("a compaction is not a rebuild; an edit that re-writes history is", () => {
+  // 110,000 tokens shrink to an 11,000-token summary: written once, nothing paid twice.
+  assert.equal(rewritten({ read: 0, write1h: 11000 }).cacheRebuilds.length, 0);
+  // The conversation stays large and most of it is written again.
+  const edited = rewritten({ read: 10000, write1h: 90000 });
+  assert.deepEqual(edited.cacheRebuilds.map((r) => r.cause), ["conversation edited"]);
+});
+
+test("an unknown option stops the run, and --help prints the options", () => {
+  const cli = fileURLToPath(new URL("../quotopsy.mjs", import.meta.url));
+  const root = logsFolder([new Session().assistant(null, { fresh: 1000 })]);
+  const cliRun = (...args) => spawnSync(process.execPath, [cli, ...args], { encoding: "utf8", env: { ...process.env, NO_COLOR: "1" } });
+  // A mistyped --redact must not print the report with names in it.
+  const typo = cliRun(root, "--json", "--redcat");
+  assert.equal(typo.status, 1);
+  assert.equal(typo.stdout, "");
+  assert.match(typo.stderr, /Unknown option: --redcat/);
+  assert.equal(cliRun(root, "-x").status, 1);
+  for (const flag of ["--help", "-h"]) assert.match(cliRun(flag).stdout, /^Usage: npx quotopsy/);
+  // The logs folder may come after the options.
+  assert.equal(JSON.parse(cliRun("--json", root).stdout).unattributedMessages, 1);
+});
+
+test("a folder that cannot be opened is skipped, not fatal", { skip: process.platform === "win32" || process.getuid?.() === 0 }, () => {
+  const root = logsFolder([new Session().assistant(null, { fresh: 1000 })]);
+  const locked = join(root, "locked");
+  mkdirSync(locked);
+  chmodSync(locked, 0o000);
+  try { assert.equal(analyze(root).unattributedMessages, 1); } finally { chmodSync(locked, 0o700); }
+});
+
+test("--redact replaces tool names that are not Claude Code's own, and odd versions and types never print", () => {
+  const s = new Session("9.9.9 /Users/someone/secret").shape("shape", [{ name: "Read", description: "r" }, { name: "AcmePayrollExport", description: "x".repeat(200) }], ["system"]);
+  s.add({ type: "odd type /Users/someone", note: 1 });
+  const call = s.blob({ role: "assistant", content: [{ type: "tool_use", id: "t1", name: "AcmePayrollExport", input: {} }] });
+  const result = s.blob({ role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "rows ".repeat(50) }] });
+  s.request("r1", { tail: [s.blob(text("go")), call, result] }).assistant("r1", { fresh: 1000 }, { content: [{ type: "tool_use", id: "t2", name: "AcmePayrollExport", input: {} }] });
+  const redacted = JSON.stringify(run([s], { redact: true, debug: true }));
+  assert.ok(!redacted.includes("AcmePayrollExport"), "tool name");
+  assert.ok(redacted.includes('"tool 1"'));
+  assert.ok(redacted.includes('"Read"'), "built-in names stay");
+  const plain = JSON.stringify(run([s], { debug: true }));
+  assert.ok(plain.includes("AcmePayrollExport"), "names show without --redact");
+  for (const out of [redacted, plain]) assert.ok(!out.includes("/Users/someone"), "a path in a version or record type");
+  assert.ok(plain.includes('"(other)"'));
+});
+
+test("a model id that could carry an account number is replaced even without --redact", () => {
+  const arn = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123";
+  const summary = run([new Session().assistant(null, { fresh: 1000 }, { model: arn }), Object.assign(new Session(), { n: 5 }).assistant(null, { fresh: 1000 }, { model: "glm-4.6" })]);
+  assert.ok(!JSON.stringify(summary).includes("123456789012"));
+  assert.deepEqual(Object.keys(summary.models).sort(), ["glm-4.6", "model 1"]);
+});
+
+test("the Haiku long-prompt rate applies when only the split cache-write fields are logged", () => {
+  const usage = { input_tokens: 0, cache_read_input_tokens: 0, cache_creation: { ephemeral_1h_input_tokens: 200000 }, output_tokens: 0 };
+  const s = new Session();
+  s.add({ type: "assistant", timestamp: at(0), message: { id: "m1", model: "claude-haiku-5-5", role: "assistant", content: [{ type: "text", text: "ok" }], usage } });
+  near(run([s]).totalWeighted, 200000 * 0.1 * 2 * 5 * M, "5x over 100,000 tokens");
+});

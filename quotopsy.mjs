@@ -42,15 +42,27 @@ const MCP = "MCP server: ", INSTRUCTIONS = "MCP instructions: ";
 const isMcp = (name) => name.startsWith("mcp__");
 const count = (map, key) => map.set(key, (map.get(key) ?? 0) + 1);
 
-function findJsonl(dir) {
+function findJsonl(dir, top = true) {
   const out = [];
-  for (const e of readdirSync(dir, { withFileTypes: true })) {
+  let entries;
+  // A folder inside the logs that cannot be opened is skipped; the logs
+  // folder itself has to open.
+  try { entries = readdirSync(dir, { withFileTypes: true }); } catch (e) { if (top) throw e; return out; }
+  for (const e of entries) {
     const p = join(dir, e.name);
-    if (e.isDirectory()) out.push(...findJsonl(p));
+    if (e.isDirectory()) out.push(...findJsonl(p, false));
     else if (e.name.endsWith(".jsonl")) out.push(p);
   }
   return out;
 }
+
+// Names Claude Code writes itself (record types, versions) are printed as
+// they are. A value in their place that does not look like one is not.
+const typeName = (v) => (/^[A-Za-z0-9_-]{1,40}$/.test(String(v)) ? String(v) : "(other)");
+const versionName = (v) => (v == null ? "unknown" : /^\d+(\.\d+){1,3}[A-Za-z0-9.+-]{0,20}$/.test(String(v)) ? String(v) : "(other)");
+// Tools that ship with Claude Code. Any other tool name may describe a
+// private system, so --redact replaces it.
+const BUILT_IN = new Set(["Agent", "Artifact", "AskUserQuestion", "Bash", "BashOutput", "CronCreate", "CronDelete", "CronList", "DeferredToolPlaceholder", "Edit", "EnterPlanMode", "EnterWorktree", "ExitPlanMode", "ExitWorktree", "Glob", "Grep", "KillShell", "ListAgents", "ListMcpResourcesTool", "LS", "Monitor", "MultiEdit", "NotebookEdit", "NotebookRead", "PushNotification", "Read", "ReadMcpResourceTool", "RemoteTrigger", "ReportFindings", "ScheduleWakeup", "SendFeedback", "SendMessage", "SendUserFile", "Skill", "SlashCommand", "Task", "TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TaskUpdate", "TodoRead", "TodoWrite", "ToolSearch", "WebFetch", "WebSearch", "Workflow", "Write", "advisor", "unknown"]);
 
 // Base64 image and document payloads are not tokenized as text. ESTIMATE:
 // drop the payload and count each as roughly 1,500 tokens' worth of chars.
@@ -105,7 +117,9 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     return (since === null || t >= since) && (until === null || t < until);
   };
   const assumedPricing = new Map(); // model -> model whose prices were used
-  const modelName = (model) => MODEL_ID.exec(model ?? "")?.[0] ?? (model ? alias("model", String(model)) : "unknown");
+  // An id with no Claude model in it is shown only if it is short and plain:
+  // a cloud resource path can carry an account number.
+  const modelName = (model) => MODEL_ID.exec(model ?? "")?.[0] ?? (model ? alias("model", String(model), !/^[A-Za-z0-9._-]{1,40}$/.test(String(model)) || /\d{6}/.test(String(model))) : "unknown");
   function rates(model, usage = {}) {
     const id = modelName(model);
     let key = id in PRICES ? id : null;
@@ -118,8 +132,8 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     if (usage.speed === "fast") per *= 2; // fast mode bills at 2x
     if (usage.inference_geo === "us") per *= 1.1; // US-only inference surcharge
     // Haiku 5.5 bills 5x on requests whose prompt is over 100,000 tokens.
-    const prompt = (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0);
-    if (key === "claude-haiku-5-5" && prompt > 100000) per *= 5;
+    const size = splitUsage(usage);
+    if (key === "claude-haiku-5-5" && size.fresh + size.write + size.read > 100000) per *= 5;
     return { fresh: input * per, write5m: 1.25 * input * per, write1h: 2 * input * per, read: read * per, output: 5 * input * per };
   }
 
@@ -128,8 +142,8 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
   // Passing `placeholders` in keeps them the same across two calls.
   const aliases = placeholders.names, aliasCounts = placeholders.counts;
   const PUBLIC_HEADINGS = new Set(["Environment", "Environment update"]); // written by Claude Code itself
-  function alias(kind, name) {
-    if (!redact || PUBLIC_HEADINGS.has(name)) return name;
+  function alias(kind, name, always = false) {
+    if (!(redact || always) || PUBLIC_HEADINGS.has(name)) return name;
     const key = kind + "\0" + name;
     if (!aliases.has(key)) {
       aliasCounts.set(kind, (aliasCounts.get(kind) ?? 0) + 1);
@@ -147,11 +161,11 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
   // The row a tool's costs add up under: its own for a built-in tool, its
   // server's for an MCP tool.
   function culpritOf(name) {
-    return isMcp(name) ? toolGroup(name) : name;
+    return isMcp(name) ? toolGroup(name) : toolLabel(name);
   }
-  // Built-in tool names are public; MCP tool names can describe private systems.
+  // Built-in tool names are public; any other can describe a private system.
   function toolLabel(name) {
-    return isMcp(name) ? alias("mcp tool", name) : name;
+    return isMcp(name) ? alias("mcp tool", name) : BUILT_IN.has(name) ? name : alias("tool", name);
   }
 
   // Split prompt text at markdown headings so a category can be broken down.
@@ -160,7 +174,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     const out = [];
     let label = "(no heading)", inMcp = false, inFence = false, chars = 0;
     const flush = () => { if (chars) out.push([label, chars]); chars = 0; };
-    for (const line of text.split("\n")) {
+    for (const line of String(text ?? "").split("\n")) {
       // A "# ..." line inside a code fence is a comment, not a heading.
       if (/^\s*(```|~~~)/.test(line)) inFence = !inFence;
       const top = !inFence && /^# (.+)/.exec(line), sub = !inFence && /^## (.+)/.exec(line);
@@ -223,18 +237,19 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       let o;
       try { o = JSON.parse(line); } catch { continue; }
       if (!o || typeof o !== "object") continue;
-      count(recordTypes, String(o.type));
+      count(recordTypes, typeName(o.type));
       if (o.type === "api-request-blob") { if (o.message && typeof o.message === "object") blobs.set(o.hash, o.message); }
       else if (o.type === "api-request-shape") { if (o.shape && typeof o.shape === "object") shapes.set(o.shapeHash, o.shape); }
-      else if (o.type === "api-request") { if (o.id) requests.push(o); }
+      else if (o.type === "api-request") { if (o.id) requests.push({ ...o, version: versionName(o.version) }); }
       else if (o.type === "attachment") {
         // Context Claude Code injects by itself: skill and agent listings,
         // MCP instructions, memory and instruction files. Sizes only.
         if (inRange(o.timestamp)) {
-          const a = attachments.get(o.attachment?.type ?? "unknown") ?? { count: 0, chars: 0 };
+          const kind = typeName(o.attachment?.type ?? "unknown");
+          const a = attachments.get(kind) ?? { count: 0, chars: 0 };
           a.count++;
           for (const r of Array.isArray(o.rendered) ? o.rendered : []) a.chars += typeof r?.content === "string" ? r.content.length : 0;
-          attachments.set(o.attachment?.type ?? "unknown", a);
+          attachments.set(kind, a);
         }
         if (o.attachment?.type === "deferred_tools_delta" && inRange(o.timestamp)) {
           // Lists the tools of every connected server, loaded or not.
@@ -249,7 +264,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
         const key = o.requestRef ?? null;
         if (String(o.message.model ?? "").startsWith("<")) continue; // synthetic local message, not an API call
         const content = (Array.isArray(o.message.content) ? o.message.content : []).filter((b) => b && typeof b === "object");
-        (key ? responses : orphans).set(key ?? o.message.id, { id: o.message.id, usage: o.message.usage, model: o.message.model, version: o.version, sidechain: !!o.isSidechain, ts: o.timestamp, thread: o.isSidechain ? `agent ${o.agentId ?? ""}` : "main" });
+        (key ? responses : orphans).set(key ?? o.message.id, { id: o.message.id, usage: o.message.usage, model: o.message.model, version: versionName(o.version), sidechain: !!o.isSidechain, ts: o.timestamp, thread: o.isSidechain ? `agent ${o.agentId ?? ""}` : "main" });
         for (const b of content) if (b.type === "tool_use") { toolNames.set(b.id, String(b.name ?? "unknown")); toolTimes.set(b.id, o.timestamp); }
         turns.set(o.message.id, [...(turns.get(o.message.id) ?? []), ...content]);
         run = [];
@@ -299,7 +314,8 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     e.requests++; e.cost += input + output; e.output += output; map.set(key, e);
   };
   // Built-in subagent types are public; custom ones are named by the user.
-  const threadOf = (source = "") => {
+  const threadOf = (given) => {
+    const source = typeof given === "string" ? given : "";
     if (source.startsWith("agent:builtin:")) return "subagent: " + source.slice(14);
     if (source.startsWith("agent:custom")) return "subagent: " + alias("agent", source.slice(13) || "custom");
     return source.startsWith("agent") ? "subagent: " + alias("agent", source) : "main thread";
@@ -410,7 +426,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       session.active = true;
       stats.requests++;
       count(stats.models, modelName(res.model));
-      const source = redact ? threadOf(req.querySource) : req.querySource ?? "unknown";
+      const source = redact ? threadOf(req.querySource) : typeof req.querySource === "string" ? req.querySource.slice(0, 80) : "unknown";
       count(stats.sources, source);
       coverage(req.version, "attributed");
       seen(req.timestamp);
@@ -503,12 +519,15 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       // starts with the same first message.
       const prev = answered.get(req.base) ?? lastOf.get(hashes[0]);
       const lost = prev ? Math.min(u.write, prev.prompt - u.read) : 0;
-      if (prev && u.read < 0.8 * prev.prompt && lost > 5000) {
+      // After a compaction the prompt is a fraction of what it was: the
+      // summary is new text written once, and nothing was paid for twice.
+      const compacted = prev && keep < baseLen && prompt < 0.5 * prev.prompt;
+      if (prev && !compacted && u.read < 0.8 * prev.prompt && lost > 5000) {
         const gapMin = (Date.parse(req.timestamp) - Date.parse(prev.ts)) / 60000;
         // An expired cache explains the rebuild whatever else changed.
         const cause = gapMin > prev.ttlMin ? "idle longer than the cache lifetime"
           : prev.model !== res.model ? "model switched mid-session"
-          : keep < baseLen ? "conversation edited or compacted"
+          : keep < baseLen ? "conversation edited"
           : req.shapeHash !== prev.shapeHash ? "tool list or system prompt changed"
           : "unknown";
         rebuilds.push({ cause, tokens: lost, wasted: lost * (writeRate - w.read), at: req.timestamp, gapMin: Math.round(gapMin), version: req.version ?? "unknown" });
@@ -586,7 +605,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
   const rebuildFix = {
     "model switched mid-session": "Pick the model before the first message, or switch in a new session.",
     "idle longer than the cache lifetime": "Before a long break, compact the conversation, or start a new session afterwards if you do not need the history. The saving is smaller than this figure when you do need it.",
-    "conversation edited or compacted": "Compact at a natural break, before the conversation is large.",
+    "conversation edited": "Editing an earlier message makes everything after it be written again. Edit early, or start a new session.",
     "tool list or system prompt changed": "Connect MCP servers before the session starts, not during it.",
     "unknown": "No fix identified yet.",
   };
@@ -600,7 +619,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     const n = loadedIn.get(r.name) ?? 0, k = r.calls ?? 0;
     // Never-called servers are reported together, below.
     if (!k || k / n > 0.05) continue;
-    findings.push({ effect: r.share + instr, what: `${server}: schemas loaded in ${n} requests, called ${k}x`, fix: "Disable it, or enable it only in the projects that use it." });
+    findings.push({ effect: r.share + instr, what: `${server}: schemas loaded in ${n} requests, called ${k}x`, fix: "If you need it only now and then, enable it only in the projects that use it." });
   }
   // Every connected server: what staying connected cost (instructions, tool
   // names, schemas) against what using it cost (calls and their results).
@@ -628,7 +647,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     fix: "Their instructions and tool names load in every request. Disable what this project does not need, at the start of a session: /mcp disable <name>",
   });
   for (const r of byMcpServer.filter((r) => r.verdict === "calls unknown" && r.share > 0)) {
-    findings.push({ effect: r.share, what: `${r.name}: instructions loaded in every session; whether you use it cannot be measured`, fix: "Disconnect it if you do not use it." });
+    findings.push({ effect: r.share, what: `${r.name}: instructions loaded whenever it is connected; whether you use it cannot be measured`, fix: "Disconnect it if you do not use it." });
   }
   const thinking = row("output")?.subs.find((x) => x.name === "thinking");
   // Thinking is paid for twice: once written as output, then re-read as part
@@ -686,7 +705,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
 export function health(summary) {
   const off = [];
   const share = (n, of) => (of ? n / of : 0), pct = (x) => (x * 100).toFixed(0) + "%";
-  if (summary.filesFailed) off.push(`${summary.filesFailed} session file${summary.filesFailed > 1 ? "s" : ""} could not be read`);
+  if (summary.filesFailed) off.push(`${summary.filesFailed} session file${summary.filesFailed > 1 ? "s" : ""} could not be read in full`);
   // Request records exist from Claude Code 2.1.300; unattributed usage on a
   // newer version means the log format is not being read as expected.
   const supported = (v) => { const [a, b, c] = v.split(".").map(Number); return a > 2 || (a === 2 && (b > 1 || (b === 1 && c >= 300))); };
@@ -706,8 +725,6 @@ export function health(summary) {
 function printDoctor(summary, ms) {
   const line = (label, value) => console.log(`${(label + ":").padEnd(22)}${value}`);
   const counts = (o) => Object.entries(o).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join(", ") || "none";
-  // Type names come from Claude Code; anything that does not look like one is not printed.
-  const typeNames = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [/^[A-Za-z0-9_-]{1,40}$/.test(k) ? k : "(other)", v]));
   const c = summary.charsPerToken, sig = summary.thinkingSignatures, off = health(summary);
   console.log("```");
   line("quotopsy", VERSION);
@@ -723,8 +740,8 @@ function printDoctor(summary, ms) {
   line("thinking signatures", sig.thinkingTokens ? `${sig.responses} responses, ${(sig.chars / sig.thinkingTokens).toFixed(2)} chars per thinking token` : "none");
   line("cache rebuilds", counts(Object.fromEntries([...new Set(summary.cacheRebuilds.map((r) => r.cause))].map((cause) => [cause, summary.cacheRebuilds.filter((r) => r.cause === cause).length]))));
   line("mcp servers", `${summary.byMcpServer.length} (${counts(Object.fromEntries([...new Set(summary.byMcpServer.map((r) => r.verdict))].map((v) => [v, summary.byMcpServer.filter((r) => r.verdict === v).length])))})`);
-  line("record types", counts(typeNames(summary.debug.recordTypes)));
-  line("injected context", counts(typeNames(Object.fromEntries(Object.entries(summary.injectedByType).map(([type, a]) => [type, a.count])))));
+  line("record types", counts(summary.debug.recordTypes));
+  line("injected context", counts(Object.fromEntries(Object.entries(summary.injectedByType).map(([type, a]) => [type, a.count]))));
   line("unattributed", counts(summary.debug.unattributed));
   line("health", off.length ? off.join("; ") : "nothing looks off");
   console.log("```");
@@ -846,7 +863,7 @@ function printReport(summary, redact) {
     off.length ? `Health: ${off.length} thing${off.length > 1 ? "s" : ""} look${off.length > 1 ? "" : "s"} off, so read the figures with more caution: ${off.join("; ")}. To report it, paste the output of npx quotopsy --doctor into an issue.`
       : `Health: nothing looks off (${summary.charsPerToken.median?.toFixed(2) ?? "?"} characters per token, ${num(summary.unattributedMessages)} requests without a request record).`,
     `Claude Code versions: ${Object.entries(summary.claudeCodeVersions).map(([v, c]) => `${v} (${num(c.attributed + c.unattributed)})`).join(", ")}.`,
-    ...(summary.filesFailed ? [`${num(summary.filesFailed)} session files could not be read and are left out.`] : []),
+    ...(summary.filesFailed ? [`${num(summary.filesFailed)} session files could not be read in full; their usage is missing or partly counted.`] : []),
     "Nothing left this machine. For a shareable summary: npx quotopsy --json --redact",
     "A lean setup kit is planned. Waitlist: https://quotopsy.com/#waitlist",
   ];
@@ -942,9 +959,21 @@ export function parseDay(text, addDays = 0, now = new Date()) {
   return d.getTime();
 }
 
+const USAGE = `Usage: npx quotopsy [logs-dir] [options]
+
+  --since=DAY    only usage from that day on (YYYY-MM-DD, or days back such as 7d)
+  --until=DAY    only usage up to the end of that day
+  --compare=DAY  usage before that day beside usage after it
+  --json         print the summary as JSON
+  --redact       replace server, tool and section names with placeholders
+  --debug        with --json, add structure-only diagnostics
+  --doctor       print a short diagnostic to paste into an issue
+  --version      print the version`;
+
 function main() {
   const args = process.argv.slice(2);
   if (args.includes("--version")) return console.log(VERSION);
+  if (args.includes("--help") || args.includes("-h")) return console.log(USAGE);
   // --doctor always redacts: its output is meant to be pasted in public.
   const doctor = args.includes("--doctor");
   const asJson = args.includes("--json"), redact = doctor || args.includes("--redact"), debug = doctor || args.includes("--debug");
@@ -968,7 +997,14 @@ function main() {
     else period[name] = at;
   }
   if (doctor) split = null;
-  const root = args.find((a) => !a.startsWith("--")) ?? join(homedir(), ".claude", "projects");
+  const known = ["--json", "--redact", "--debug", "--doctor"];
+  const unknown = args.find((a) => a.startsWith("-") && !known.includes(a));
+  // A mistyped --redact must not print names: stop instead of carrying on.
+  if (unknown) {
+    console.error(`Unknown option: ${unknown}\n\n${USAGE}`);
+    process.exit(1);
+  }
+  const root = args.find((a) => !a.startsWith("-")) ?? join(homedir(), ".claude", "projects");
 
   const started = Date.now();
   let lastDraw = 0, bannerShown = false;
@@ -992,7 +1028,7 @@ function main() {
     summary = analyze(root, { redact, debug, onProgress, placeholders, ...period, ...(split ? { until: Math.min(period.until ?? Infinity, split.day) } : {}) });
     if (split) after = analyze(root, { redact, debug, placeholders, ...period, since: Math.max(period.since ?? -Infinity, split.next) });
   } catch (e) {
-    if (e?.code !== "ENOENT" && e?.code !== "ENOTDIR") throw e;
+    if (!["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(e?.code)) throw e;
   }
   if (!summary?.filesScanned) {
     console.error(`No Claude Code session logs found in ${root}\nPass the folder that holds them: npx quotopsy <logs-dir>`);
