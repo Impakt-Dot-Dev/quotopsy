@@ -37,7 +37,7 @@ const PRICES = {
 // the same family, and reported so the reader knows.
 const FAMILY = { fable: "claude-fable-5-2", mythos: "claude-mythos-5-2", opus: "claude-opus-5-5", sonnet: "claude-sonnet-5-5", haiku: "claude-haiku-5-5" };
 // Kept equal to "version" in package.json; a test checks it.
-export const VERSION = "0.5.1";
+export const VERSION = "0.5.2";
 // Values Claude Code itself sets for how a session was started.
 const ENTRYPOINTS = new Set(["cli", "remote", "sdk-ts", "sdk-py", "sdk-cli", "claude-vscode", "claude-desktop"]);
 // Of those, the ones seen to log no request records at all.
@@ -912,7 +912,7 @@ function printReport(summary, redact) {
     `Claude Code versions: ${Object.entries(summary.claudeCodeVersions).map(([v, c]) => `${v} (${num(c.attributed + c.unattributed)})`).join(", ")}.`,
     ...(summary.filesFailed ? [`${num(summary.filesFailed)} session files could not be read in full; their usage is missing or partly counted.`] : []),
     "Nothing left this machine. For a shareable summary: npx quotopsy --json --redact",
-    "A lean setup kit is planned. Waitlist: https://quotopsy.com/#waitlist",
+    "Lean setup kit (settings, cache-countdown status line, habits), $19: https://quotopsy.com/#buy",
   ];
   for (const note of notes) wrap(note, "  · ", "    ", (t) => out(DIM, t));
   console.log();
