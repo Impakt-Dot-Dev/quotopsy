@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
-import { analyze, compare, hashMessage, health, parseDay, VERSION } from "../quotopsy.mjs";
+import { analyze, compare, hashMessage, health, limits, parseDay, VERSION } from "../quotopsy.mjs";
 
 const OPUS = "claude-opus-5-5"; // $4 in, $0.20 cache read, $8 one-hour write, $20 out, per million tokens
 const M = 1e-6;
@@ -399,7 +399,8 @@ test("survives records with missing or oddly shaped fields", () => {
   assert.deepEqual(summary.models, { unknown: 3 });
 });
 
-test("one unreadable session does not lose the others", () => {
+// Root can read a file whatever its mode, so the locked file would not throw.
+test("one unreadable session does not lose the others", { skip: process.getuid?.() === 0 && "runs as root, which can read any file" }, () => {
   const good = new Session().assistant(null, { fresh: 100 });
   const root = mkdtempSync(join(tmpdir(), "quotopsy-test-"));
   writeFileSync(join(root, "good.jsonl"), good.lines.join("\n"));
@@ -878,4 +879,100 @@ test("a request that wrote nothing keeps the five-minute lifetime it inherited",
   // Five-minute writes, then a request that only reads, then 10 idle minutes.
   const summary = run([conversation({ minute: 1, usage: { read: 20000 } }, { minute: 11, usage: { read: 1000, write5m: 25000 } })].map((s) => { s.lines = s.lines.map((l) => l.replace('"ephemeral_1h_input_tokens":20000,"ephemeral_5m_input_tokens":0', '"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":20000')); return s; }));
   assert.deepEqual(summary.cacheRebuilds.map((r) => r.cause), ["idle longer than the cache lifetime"]);
+});
+
+// Stamps every record with how the session was started, as Claude Code does.
+const startedFrom = (session, entrypoint) => {
+  session.lines = session.lines.map((line) => JSON.stringify({ ...JSON.parse(line), entrypoint }));
+  return session;
+};
+
+test("terminal sessions with request records are fully attributed and healthy", () => {
+  // The shape of a healthy recent log: request records, blobs, responses that
+  // point at their request, started from the terminal.
+  const s = new Session("2.1.325").shape("shape", [{ name: "Bash", description: "b".repeat(100) }], ["system"]);
+  s.request("r1", { tail: [s.blob(text("hi ".repeat(200)))] }).assistant("r1", { write1h: 300 });
+  s.request("r2", { base: "r1", keep: 1, tail: [s.blob(text("more ".repeat(100)))], minute: 1 }).assistant("r2", { read: 300, write1h: 150 }, { minute: 1 });
+  const summary = run([startedFrom(s, "cli")]);
+  assert.equal(summary.requests, 2);
+  assert.equal(summary.unattributedMessages, 0);
+  assert.deepEqual(summary.withoutRequestRecords, {});
+  assert.equal(category(summary, "unattributed input"), undefined);
+  assert.deepEqual(health(summary), []);
+});
+
+test("sessions started from remote that log no request records are explained, not flagged as a reading fault", () => {
+  // Claude Code on the web logs responses and the transcript, but no
+  // api-request, api-request-blob or api-request-shape records.
+  const remote = new Session("2.1.328").user("hello")
+    .assistant(null, { write1h: 2000, output: 50 })
+    .user("again")
+    .assistant(null, { read: 2000, write1h: 100, output: 50 }, { minute: 1 });
+  const summary = run([startedFrom(remote, "remote")]);
+  assert.equal(summary.requests, 0);
+  assert.equal(summary.unattributedMessages, 2);
+  assert.deepEqual(summary.withoutRequestRecords, { "2.1.328": { remote: 2 } });
+  // Expected, so it is a limit to know about, not a fault to report.
+  assert.deepEqual(health(summary), []);
+  assert.match(limits(summary).join("; "), /100% of requests come from sessions started from Claude Code on the web, which logged no request records/);
+});
+
+test("other entrypoints without request records are not excused", () => {
+  // Only entrypoints seen to log no request records are excused.
+  const headless = new Session("2.1.328").assistant(null, { fresh: 1000 });
+  const summary = run([startedFrom(headless, "sdk-cli")]);
+  assert.deepEqual(summary.withoutRequestRecords, {});
+  assert.deepEqual(limits(summary), []);
+  assert.match(health(summary).join("; "), /could not be attributed/);
+});
+
+test("an entrypoint Claude Code does not set itself is hidden", () => {
+  // An SDK can set its own value, which could name a product.
+  const cli = fileURLToPath(new URL("../quotopsy.mjs", import.meta.url));
+  const custom = startedFrom(new Session("2.1.328").assistant(null, { fresh: 1000 }), "acme-billing-bot");
+  const result = spawnSync(process.execPath, [cli, logsFolder([custom]), "--doctor"], { encoding: "utf8", env: { ...process.env, NO_COLOR: "1" } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(!result.stdout.includes("acme"), "custom entrypoint leaked");
+  assert.match(result.stdout, /started from \(other\)/);
+});
+
+test("a file is judged by the first entrypoint it logs", () => {
+  // A resumed session may log more than one; the first one names the file.
+  const s = new Session("2.1.328").assistant(null, { fresh: 1000 });
+  startedFrom(s, "remote");
+  s.lines.push(JSON.stringify({ ...JSON.parse(new Session("2.1.328").assistant(null, { fresh: 1000 }, { minute: 1 }).lines[0]), message: { id: "msg_99", model: OPUS, role: "assistant", content: [], usage: usageOf({ fresh: 1000 }) }, entrypoint: "cli" }));
+  const summary = run([s]);
+  assert.deepEqual(summary.withoutRequestRecords, { "2.1.328": { remote: 2 } });
+});
+
+test("missing request records still warn when the session was started from the terminal", () => {
+  // From the terminal, Claude Code 2.1.300 and newer logs request records, so
+  // their absence means the log format changed.
+  const cli = new Session("2.1.328").assistant(null, { fresh: 1000 }).assistant(null, { fresh: 1000 }, { minute: 1 });
+  const summary = run([startedFrom(cli, "cli")]);
+  assert.deepEqual(summary.withoutRequestRecords, {});
+  assert.match(health(summary).join("; "), /100% of requests on Claude Code 2\.1\.300 or newer could not be attributed/);
+});
+
+test("a remote session that logs request records but cannot be matched still warns", () => {
+  // Request records exist but no response points at one: a reading fault.
+  const s = new Session("2.1.328").shape("shape", [], ["system"]);
+  s.request("r1", { tail: [s.blob(text("hi"))] });
+  s.assistant(null, { fresh: 1000 }).assistant(null, { fresh: 1000 }, { minute: 1 });
+  const summary = run([startedFrom(s, "remote")]);
+  assert.deepEqual(summary.withoutRequestRecords, {});
+  assert.match(health(summary).join("; "), /could not be attributed/);
+});
+
+test("a mix of healthy terminal sessions and remote sessions keeps the terminal ones attributed", () => {
+  const s = new Session("2.1.325").shape("shape", [{ name: "Bash", description: "b".repeat(100) }], ["system"]);
+  s.request("r1", { tail: [s.blob(text("hi ".repeat(200)))] }).assistant("r1", { write1h: 300 });
+  const remote = new Session("2.1.328");
+  remote.n = 100; // message ids are unique across sessions, as in real logs
+  remote.assistant(null, { fresh: 1000 });
+  const summary = run([startedFrom(s, "cli"), startedFrom(remote, "remote")]);
+  assert.equal(summary.requests, 1);
+  assert.equal(summary.unattributedMessages, 1);
+  assert.deepEqual(summary.claudeCodeVersions["2.1.325"], { attributed: 1, unattributed: 0 });
+  assert.doesNotMatch(health(summary).join("; "), /could not be attributed/);
 });
