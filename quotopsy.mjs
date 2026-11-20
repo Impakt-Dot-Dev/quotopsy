@@ -37,7 +37,11 @@ const PRICES = {
 // the same family, and reported so the reader knows.
 const FAMILY = { fable: "claude-fable-5-2", mythos: "claude-mythos-5-2", opus: "claude-opus-5-5", sonnet: "claude-sonnet-5-5", haiku: "claude-haiku-5-5" };
 // Kept equal to "version" in package.json; a test checks it.
-export const VERSION = "0.5.0";
+export const VERSION = "0.5.1";
+// Values Claude Code itself sets for how a session was started.
+const ENTRYPOINTS = new Set(["cli", "remote", "sdk-ts", "sdk-py", "sdk-cli", "claude-vscode", "claude-desktop"]);
+// Of those, the ones seen to log no request records at all.
+const UNLOGGED_ENTRYPOINTS = new Set(["remote"]);
 const MCP = "MCP server: ", INSTRUCTIONS = "MCP instructions: ";
 const isMcp = (name) => name.startsWith("mcp__");
 const count = (map, key) => map.set(key, (map.get(key) ?? 0) + 1);
@@ -237,12 +241,16 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     const transcript = []; // messages only logged as transcript records
     let run = []; // user records since the last assistant record
     const recordTypes = new Map();
+    let entrypoint = null; // how the session was started: cli, remote, an SDK...
     for (const line of readFileSync(file, "utf8").split("\n")) {
       if (!line) continue;
       let o;
       try { o = JSON.parse(line); } catch { continue; }
       if (!o || typeof o !== "object") continue;
       count(recordTypes, typeName(o.type));
+      // The first value names the file. Values Claude Code sets itself are kept;
+      // any other (an SDK can set its own) could name a product, so it is hidden.
+      if (!entrypoint && typeof o.entrypoint === "string" && o.entrypoint) entrypoint = ENTRYPOINTS.has(o.entrypoint) ? o.entrypoint : "(other)";
       if (o.type === "api-request-blob") { if (o.message && typeof o.message === "object") blobs.set(o.hash, o.message); }
       else if (o.type === "api-request-shape") { if (o.shape && typeof o.shape === "object") shapes.set(o.shapeHash, o.shape); }
       else if (o.type === "api-request") { if (o.id) requests.push({ ...o, version: versionName(o.version) }); }
@@ -295,7 +303,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     // A response whose request was not logged is usage without a known cause.
     const logged = new Set(requests.map((r) => r.id));
     for (const [ref, res] of responses) if (!logged.has(ref)) { orphans.set(`ref ${ref}`, res); responses.delete(ref); }
-    return { blobs, shapes, requests, responses, orphans, toolNames, toolTimes, turns, recordTypes };
+    return { blobs, shapes, requests, responses, orphans, toolNames, toolTimes, turns, recordTypes, entrypoint };
   }
 
   const cats = new Map(); // category -> { read, write, fresh, output, weighted, subs }
@@ -306,7 +314,7 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     cats.set(cat, c);
   };
 
-  const stats = { files: 0, failedFiles: 0, requests: 0, noResponse: 0, unattributed: 0, missingBlobs: 0, charsPerToken: [], models: new Map(), versions: new Map(), sources: new Map(), first: null, last: null };
+  const stats = { files: 0, failedFiles: 0, requests: 0, noResponse: 0, unattributed: 0, unlogged: new Map(), missingBlobs: 0, charsPerToken: [], models: new Map(), versions: new Map(), sources: new Map(), first: null, last: null };
   // Claude Code version -> requests that could and could not be attributed
   const coverage = (version, key) => {
     const v = stats.versions.get(version ?? "unknown") ?? { attributed: 0, unattributed: 0 };
@@ -546,12 +554,12 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       answered.set(req.id, { prompt, ts: req.timestamp, model: res.model, shapeHash: req.shapeHash, ttlMin: lifetime(u, prev) });
       lastOf.set(hashes[0], answered.get(req.id));
     }
-    pendingOrphans.push({ session, hasRequests: s.requests.length > 0, list: [...s.orphans.values()].map((o) => ({ ...o, calling: outputShares(s.turns.get(o.id)), signature: signatureChars(s.turns.get(o.id)) })) });
+    pendingOrphans.push({ session, hasRequests: s.requests.length > 0, entrypoint: s.entrypoint, list: [...s.orphans.values()].map((o) => ({ ...o, calling: outputShares(s.turns.get(o.id)), signature: signatureChars(s.turns.get(o.id)) })) });
     return session;
   }
 
   // Sessions without request records: usage is known, its cause is not.
-  function countOrphans({ session, hasRequests, list }) {
+  function countOrphans({ session, hasRequests, entrypoint, list }) {
     const lastOrphan = new Map(); // thread -> its previous message
     for (const { id, usage, model, version, sidechain, ts, thread, calling, signature } of list) {
       if (id && counted.has(id)) continue;
@@ -566,7 +574,14 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
       coverage(version, "unattributed");
       count(stats.models, modelName(model));
       seen(ts);
-      count(debug.unattributed, `version ${version ?? "unknown"}, ${sidechain ? "subagent" : "main"} thread, file ${hasRequests ? "has" : "has no"} request records`);
+      count(debug.unattributed, `version ${version ?? "unknown"}, ${sidechain ? "subagent" : "main"} thread, file ${hasRequests ? "has" : "has no"} request records${entrypoint ? `, started from ${entrypoint}` : ""}`);
+      // Sessions started where Claude Code is known to log no request records
+      // at all (Claude Code on the web): expected, not a reading fault.
+      if (!hasRequests && UNLOGGED_ENTRYPOINTS.has(entrypoint)) {
+        const byEntry = stats.unlogged.get(version ?? "unknown") ?? new Map();
+        count(byEntry, entrypoint);
+        stats.unlogged.set(version ?? "unknown", byEntry);
+      }
       const u = splitUsage(usage), w = rates(model, usage);
       const cat = "unattributed input";
       stats.unattributed++;
@@ -690,7 +705,9 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
     from: stats.first, to: stats.last, models: Object.fromEntries(stats.models),
     thinkingSignatures: signatures,
     charsPerToken: { min: cpt[0], p5: q(0.05), median: q(0.5), p95: q(0.95), max: cpt[cpt.length - 1], shareOutside2to4_5: offRatio },
-    claudeCodeVersions: Object.fromEntries(stats.versions), querySources: Object.fromEntries(stats.sources),
+    claudeCodeVersions: Object.fromEntries(stats.versions),
+    withoutRequestRecords: Object.fromEntries([...stats.unlogged].map(([v, m]) => [v, Object.fromEntries(m)])),
+    querySources: Object.fromEntries(stats.sources),
     totalWeighted: total, categories: rows, cacheRebuilds: rebuilds, findings,
     byModel: ranked(byModel), byThread: ranked(byThread), byTool, byMcpServer,
     injectedByType: Object.fromEntries([...attachments].sort((a, b) => b[1].chars - a[1].chars)),
@@ -705,6 +722,28 @@ export function analyze(root, { redact = false, debug: debugOn = false, onProgre
   return summary;
 }
 
+// Requests on recent versions, and how many of them come from sessions that
+// are known to log no request records.
+function unloggedShare(summary, supported) {
+  const recent = Object.entries(summary.claudeCodeVersions).filter(([v]) => supported(v));
+  const unlogged = summary.withoutRequestRecords ?? {};
+  const sum = (o) => Object.values(o ?? {}).reduce((n, x) => n + x, 0);
+  const explained = recent.reduce((n, [v]) => n + sum(unlogged[v]), 0);
+  const all = recent.reduce((n, [, c]) => n + c.attributed + c.unattributed, 0);
+  const from = [...new Set(recent.flatMap(([v]) => Object.keys(unlogged[v] ?? {})))].sort();
+  return { recent, explained, all, from };
+}
+const supportedVersion = (v) => { const [a, b, c] = v.split(".").map(Number); return a > 2 || (a === 2 && (b > 1 || (b === 1 && c >= 300))); };
+
+// Limits that are expected rather than faults: the reader should know, but
+// there is nothing to report.
+export function limits(summary) {
+  const { explained, all, from } = unloggedShare(summary, supportedVersion);
+  if (!all || explained / all <= 0.02) return [];
+  const where = from.map((e) => (e === "remote" ? "Claude Code on the web" : e)).join(", ");
+  return [`${((explained / all) * 100).toFixed(0)}% of requests come from sessions started from ${where}, which logged no request records, so their input could not be split by part`];
+}
+
 // Signs that the numbers deserve less trust than usual, from the summary
 // alone. An empty list means none were found.
 export function health(summary) {
@@ -713,9 +752,9 @@ export function health(summary) {
   if (summary.filesFailed) off.push(`${summary.filesFailed} session file${summary.filesFailed > 1 ? "s" : ""} could not be read in full`);
   // Request records exist from Claude Code 2.1.300; unattributed usage on a
   // newer version means the log format is not being read as expected.
-  const supported = (v) => { const [a, b, c] = v.split(".").map(Number); return a > 2 || (a === 2 && (b > 1 || (b === 1 && c >= 300))); };
-  const recent = Object.entries(summary.claudeCodeVersions).filter(([v]) => supported(v));
-  const lost = recent.reduce((n, [, c]) => n + c.unattributed, 0), all = recent.reduce((n, [, c]) => n + c.attributed + c.unattributed, 0);
+  const supported = supportedVersion;
+  const { recent, explained, all } = unloggedShare(summary, supported);
+  const lost = recent.reduce((n, [, c]) => n + c.unattributed, 0) - explained;
   if (share(lost, all) > 0.02) off.push(`${pct(share(lost, all))} of requests on Claude Code 2.1.300 or newer could not be attributed`);
   if (summary.charsPerToken.shareOutside2to4_5 > 0.05) off.push(`${pct(summary.charsPerToken.shareOutside2to4_5)} of prompts were rebuilt at an unlikely size`);
   if (share(summary.missingBlobs, summary.requests) > 0.05) off.push(`${summary.missingBlobs} messages were missing from the log`);
@@ -749,6 +788,8 @@ function printDoctor(summary, ms) {
   line("injected context", counts(Object.fromEntries(Object.entries(summary.injectedByType).map(([type, a]) => [type, a.count]))));
   line("unattributed", counts(summary.debug.unattributed));
   line("health", off.length ? off.join("; ") : "nothing looks off");
+  const known = limits(summary);
+  if (known.length) line("expected limits", known.join("; "));
   console.log("```");
 }
 
@@ -867,6 +908,7 @@ function printReport(summary, redact) {
     ...Object.entries(summary.assumedPricing).map(([model, as]) => `No published price known for ${model}; priced as ${as}.`),
     off.length ? `Health: ${off.length} thing${off.length > 1 ? "s" : ""} look${off.length > 1 ? "" : "s"} off, so read the figures with more caution: ${off.join("; ")}. To report it, paste the output of npx quotopsy --doctor into an issue.`
       : `Health: nothing looks off (${summary.charsPerToken.median?.toFixed(2) ?? "?"} characters per token, ${num(summary.unattributedMessages)} requests without a request record).`,
+    ...limits(summary).map((l) => `Not a fault: ${l}.`),
     `Claude Code versions: ${Object.entries(summary.claudeCodeVersions).map(([v, c]) => `${v} (${num(c.attributed + c.unattributed)})`).join(", ")}.`,
     ...(summary.filesFailed ? [`${num(summary.filesFailed)} session files could not be read in full; their usage is missing or partly counted.`] : []),
     "Nothing left this machine. For a shareable summary: npx quotopsy --json --redact",
